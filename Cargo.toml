@@ -1,0 +1,18 @@
+[package]
+name = "metrics"
+version = "0.1.0"
+edition = "2024"
+description = "lightweight high-concurrency metric slot registry"
+license = "Apache-2.0"
+
+[dependencies]
+ahash = "0.8"
+chrono = "0.4"
+ds = { path = "../ds" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "metrics"
+harness = false
