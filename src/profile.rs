@@ -63,6 +63,10 @@ impl Registry {
         let timestamp = timestamp.format("%Y-%m-%d %H:%M:%S").to_string();
         let mut writer = ProfileLogWriter::new(file, buffer, timestamp);
         self.for_each_meta(|meta| writer.write_entry(meta));
+        // Java's ProfileUtil.logBaselineAccessStaticstic() appends a fixed
+        // sentinel entry after every interval so monitors can confirm the
+        // profiler is alive. The values are constant by design.
+        writer.write_baseline_entry();
         writer.finish()
     }
 }
@@ -100,6 +104,25 @@ impl<'a> ProfileLogWriter<'a> {
             meta.kind.profile(),
             drain(meta.item),
         );
+        if self.buffer.len() >= PROFILE_BUFFER_LIMIT {
+            self.flush_buffer();
+        }
+    }
+
+    /// Appends the fixed `other://profile_baseline` sentinel, mirroring Java's
+    /// `ProfileUtil.logBaselineAccessStaticstic()`. Values are constant by design.
+    fn write_baseline_entry(&mut self) {
+        if self.error.is_some() {
+            return;
+        }
+        // type=OTHER, total=10, error=1, slow=1, avg=1.00,
+        // interval1=6, interval2=1, interval3=1, interval4=1, interval5=1
+        writeln!(
+            self.buffer,
+            "{} {{\"type\":\"OTHER\",\"name\":\"other://profile_baseline\",\"total_count\":10,\"error_count\":1,\"slow_count\":1,\"avg_time\":1.0,\"interval1\":6,\"interval2\":1,\"interval3\":1,\"interval4\":1,\"interval5\":1}}",
+            self.timestamp,
+        )
+        .expect("writing to a Vec<u8> cannot fail");
         if self.buffer.len() >= PROFILE_BUFFER_LIMIT {
             self.flush_buffer();
         }
