@@ -133,6 +133,43 @@ mod tests {
     }
 
     #[test]
+    fn service_profile_matches_resource_format() {
+        let registry = Registry::new();
+        let metric = registry.register(
+            "org.example.service.ExampleService.operation",
+            MetricType::Service,
+        );
+        metric.record(Duration::from_millis(201), true);
+
+        let path = std::env::temp_dir().join(format!(
+            "metrics-service-profile-test-{}-{}.log",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_file(&path);
+        let offset = FixedOffset::east_opt(profile::SHANGHAI_OFFSET_SECONDS).unwrap();
+        let timestamp = offset
+            .with_ymd_and_hms(2026, 8, 23, 22, 25, 38)
+            .single()
+            .unwrap();
+        let mut buffer = Vec::with_capacity(profile::PROFILE_BUFFER_LIMIT);
+        registry
+            .write_profile_log(&path, timestamp, &mut buffer)
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            concat!(
+                "2026-08-23 22:25:38 ",
+                "{\"type\":\"SERVICE\",\"name\":\"org.example.service.ExampleService.operation\",",
+                "\"slowThreshold\":200,\"total_count\":1,\"error_count\":0,\"slow_count\":1,\"avg_time\":\"201.00\",",
+                "\"interval1\":0,\"interval2\":0,\"interval3\":0,\"interval4\":0,\"interval5\":1}\n"
+            )
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn rpc_service_whole_profile_uses_access_statistic_shape() {
         let registry = Registry::new();
         let metric = registry.register(

@@ -42,6 +42,9 @@ impl ItemPtr {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MetricType {
     Redis,
+    /// ProfileUtil service metric. This uses the resource-shaped JSON fields
+    /// but has the service slow threshold expected by legacy dashboards.
+    Service,
     RpcServiceWhole,
 }
 
@@ -61,6 +64,15 @@ impl MetricType {
             Self::Redis => ProfileSpec {
                 label: "REDIS",
                 slow_threshold_ms: 50,
+                intervals_ms: [10, 50, 100, 200],
+                log_format: ProfileLogFormat::Resource,
+            },
+            // Java UserInfoServiceImpl.localMcHit/localMcSet use SERVICE with
+            // the same bucket layout as resource metrics and a 200 ms slow
+            // threshold.
+            Self::Service => ProfileSpec {
+                label: "SERVICE",
+                slow_threshold_ms: 200,
                 intervals_ms: [10, 50, 100, 200],
                 log_format: ProfileLogFormat::Resource,
             },
