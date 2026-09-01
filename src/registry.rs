@@ -1,5 +1,7 @@
-use crate::MetricType;
+use crate::metric::MetricType;
 use crate::metric::{ItemPtr, Metric, MetricSnapshot, Slot, snapshot};
+use crate::plan::{MetricPolicy, ProfileMeta, ProfilePlan};
+use crate::state::{StateRegistry, StateSnapshot, StateType};
 use ahash::RandomState;
 use ds::{CowReadHandle, CowWriteHandle, cow};
 use std::cell::UnsafeCell;
@@ -15,9 +17,8 @@ type FastHashMap<K, V> = HashMap<K, V, RandomState>;
 
 #[derive(Clone)]
 pub(crate) struct MetricMeta {
-    pub(crate) name: Arc<str>,
-    pub(crate) kind: MetricType,
     pub(crate) item: ItemPtr,
+    pub(crate) profile: ProfileMeta,
 }
 
 /// Metadata for up to `CHUNK_SIZE` metrics.
@@ -98,6 +99,7 @@ struct ShardState {
     /// Splitting by kind permits `get(name)` to borrow `&str`, avoiding a temporary allocation for
     /// repeated registrations.
     by_type: FastHashMap<MetricType, FastHashMap<Arc<str>, ItemPtr>>,
+    by_profile: FastHashMap<MetricPolicy, FastHashMap<Arc<str>, ItemPtr>>,
     slots: Vec<Box<[Slot; CHUNK_SIZE]>>,
     meta_chunks: Vec<Arc<MetaChunk>>,
     len: usize,
@@ -110,6 +112,7 @@ impl ShardState {
     fn new(index_writer: CowWriteHandle<ShardIndex>) -> Self {
         Self {
             by_type: FastHashMap::default(),
+            by_profile: FastHashMap::default(),
             slots: Vec::new(),
             meta_chunks: Vec::new(),
             len: 0,
@@ -121,7 +124,11 @@ impl ShardState {
         self.by_type.get(&kind)?.get(name).copied()
     }
 
-    fn insert(&mut self, name: Arc<str>, kind: MetricType) -> Metric {
+    fn existing_profile(&self, identity: &str, policy: MetricPolicy) -> Option<ItemPtr> {
+        self.by_profile.get(&policy)?.get(identity).copied()
+    }
+
+    fn allocate(&mut self, profile: ProfileMeta, policy: MetricPolicy) -> (Metric, ItemPtr) {
         let index = self.len;
         let chunk_index = index / CHUNK_SIZE;
         let offset = index % CHUNK_SIZE;
@@ -139,14 +146,9 @@ impl ShardState {
             unsafe { chunk.add(offset) }
         };
         let item = ItemPtr::from_raw(slot);
-        let meta = MetricMeta {
-            name: Arc::clone(&name),
-            kind,
-            item,
-        };
+        let meta = MetricMeta { item, profile };
 
         self.meta_chunks[chunk_index].publish(offset, meta);
-        self.by_type.entry(kind).or_default().insert(name, item);
         self.len += 1;
 
         if is_new_chunk {
@@ -158,7 +160,28 @@ impl ShardState {
             self.index_writer.update(index);
         }
 
-        Metric::new(item, kind)
+        (Metric::new(item, policy), item)
+    }
+
+    fn insert(&mut self, name: Arc<str>, kind: MetricType) -> Metric {
+        let profile = ProfileMeta::Single {
+            name: Arc::clone(&name),
+            kind,
+        };
+        let (metric, item) = self.allocate(profile, kind.policy());
+        self.by_type.entry(kind).or_default().insert(name, item);
+        metric
+    }
+
+    fn insert_profile(&mut self, plan: Arc<ProfilePlan>) -> Metric {
+        let identity = Arc::clone(&plan.identity);
+        let policy = plan.policy;
+        let (metric, item) = self.allocate(ProfileMeta::Fanout(plan), policy);
+        self.by_profile
+            .entry(policy)
+            .or_default()
+            .insert(identity, item);
+        metric
     }
 }
 
@@ -181,14 +204,23 @@ impl Shard {
     pub(crate) fn register(&self, name: &str, kind: MetricType) -> Metric {
         let mut state = self.state.lock().expect("metrics shard mutex poisoned");
         if let Some(item) = state.existing(name, kind) {
-            return Metric::new(item, kind);
+            return Metric::new(item, kind.policy());
         }
         state.insert(Arc::from(name), kind)
+    }
+
+    pub(crate) fn register_profile(&self, plan: ProfilePlan) -> Metric {
+        let mut state = self.state.lock().expect("metrics shard mutex poisoned");
+        if let Some(item) = state.existing_profile(&plan.identity, plan.policy) {
+            return Metric::new(item, plan.policy);
+        }
+        state.insert_profile(Arc::new(plan))
     }
 }
 
 pub(crate) struct Registry {
     shards: [Shard; SHARD_COUNT],
+    states: StateRegistry,
     /// A keyed fast hasher avoids repeatedly paying SipHash's long-string cost while preserving
     /// collision-steering resistance for shard selection.
     shard_hasher: RandomState,
@@ -198,6 +230,7 @@ impl Registry {
     pub(crate) fn new() -> Self {
         Self {
             shards: std::array::from_fn(|_| Shard::new()),
+            states: StateRegistry::default(),
             shard_hasher: RandomState::new(),
         }
     }
@@ -211,11 +244,25 @@ impl Registry {
         self.shards[self.shard(name, kind)].register(name, kind)
     }
 
+    pub(crate) fn register_profile(&self, plan: ProfilePlan) -> Metric {
+        let shard = (self.shard_hasher.hash_one((&plan.identity, plan.policy)) as usize)
+            & (SHARD_COUNT - 1);
+        self.shards[shard].register_profile(plan)
+    }
+
+    pub(crate) fn record_state(&self, state_type: StateType, name: &str, key: &str, value: &str) {
+        self.states.record(state_type, name, key, value);
+    }
+
+    pub(crate) fn state_snapshot(&self) -> Vec<StateSnapshot> {
+        self.states.snapshot()
+    }
+
     pub(crate) fn visit<F>(&self, mut f: F)
     where
-        F: FnMut(&str, MetricType, MetricSnapshot),
+        F: FnMut(&MetricMeta, MetricSnapshot),
     {
-        self.for_each_meta(|meta| f(&meta.name, meta.kind, snapshot(meta.item)));
+        self.for_each_meta(|meta| f(meta, snapshot(meta.item)));
     }
 
     pub(crate) fn len(&self) -> usize {

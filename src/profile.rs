@@ -1,6 +1,9 @@
-use crate::metric::{MetricSnapshot, ProfileLogFormat, ProfileSpec, drain};
+use crate::metric::{MetricSnapshot, MetricSpec, drain};
+use crate::plan::{MetricPolicy, ProfileFormat, ProfileMeta, ProfileOutput};
 use crate::registry::{MetricMeta, Registry};
+use crate::state::StateSnapshot;
 use chrono::{DateTime, FixedOffset, Utc};
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -63,6 +66,10 @@ impl Registry {
         let timestamp = timestamp.format("%Y-%m-%d %H:%M:%S").to_string();
         let mut writer = ProfileLogWriter::new(file, buffer, timestamp);
         self.for_each_meta(|meta| writer.write_entry(meta));
+        writer.write_aggregate_entries();
+        for state in self.state_snapshot() {
+            writer.write_state_entry(&state);
+        }
         // Java's ProfileUtil.logBaselineAccessStaticstic() appends a fixed
         // sentinel entry after every interval so monitors can confirm the
         // profiler is alive. The values are constant by design.
@@ -77,6 +84,14 @@ struct ProfileLogWriter<'a> {
     buffer: &'a mut Vec<u8>,
     timestamp: String,
     error: Option<io::Error>,
+    aggregates: HashMap<AggregateKey, MetricSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct AggregateKey {
+    output: ProfileOutput,
+    policy: MetricPolicy,
+    format: ProfileFormat,
 }
 
 impl<'a> ProfileLogWriter<'a> {
@@ -87,6 +102,7 @@ impl<'a> ProfileLogWriter<'a> {
             buffer,
             timestamp,
             error: None,
+            aggregates: HashMap::new(),
         }
     }
 
@@ -97,12 +113,91 @@ impl<'a> ProfileLogWriter<'a> {
 
         // `swap(0)` keeps the interval accounting lossless. A record racing this drain can have
         // fields split across adjacent intervals, but each individual counter is emitted once.
+        let snapshot = drain(meta.item);
+        match &meta.profile {
+            ProfileMeta::Single { name, kind } => {
+                let (metric_type, format) = kind.output();
+                self.append_entry(metric_type, name, kind.policy(), format, snapshot);
+            }
+            ProfileMeta::Fanout(plan) => {
+                for output in plan.outputs.iter() {
+                    self.append_entry(
+                        &output.metric_type,
+                        &output.name,
+                        plan.policy,
+                        plan.format,
+                        snapshot,
+                    );
+                }
+                if let Some(output) = &plan.aggregate {
+                    self.aggregates
+                        .entry(AggregateKey {
+                            output: output.clone(),
+                            policy: plan.policy,
+                            format: plan.format,
+                        })
+                        .or_default()
+                        .merge(snapshot);
+                }
+            }
+        }
+    }
+
+    fn write_aggregate_entries(&mut self) {
+        let mut entries: Vec<_> = self.aggregates.drain().collect();
+        entries.sort_unstable_by(|(left, _), (right, _)| {
+            (&left.output.metric_type, &left.output.name)
+                .cmp(&(&right.output.metric_type, &right.output.name))
+        });
+        for (key, snapshot) in entries {
+            self.append_entry(
+                &key.output.metric_type,
+                &key.output.name,
+                key.policy,
+                key.format,
+                snapshot,
+            );
+        }
+    }
+
+    fn write_state_entry(&mut self, state: &StateSnapshot) {
+        if self.error.is_some() {
+            return;
+        }
+        write!(
+            self.buffer,
+            "{} {{\"type\":\"{}\",\"name\":\"{}\"",
+            self.timestamp,
+            state.state_type.profile_type(),
+            state.name,
+        )
+        .expect("writing to a Vec<u8> cannot fail");
+        for (key, value) in &state.fields {
+            write!(self.buffer, ",\"{key}\":\"{value}\"")
+                .expect("writing to a Vec<u8> cannot fail");
+        }
+        writeln!(self.buffer, "}}").expect("writing to a Vec<u8> cannot fail");
+        if self.buffer.len() >= PROFILE_BUFFER_LIMIT {
+            self.flush_buffer();
+        }
+    }
+
+    fn append_entry(
+        &mut self,
+        metric_type: &str,
+        name: &str,
+        policy: MetricPolicy,
+        format: ProfileFormat,
+        snapshot: MetricSnapshot,
+    ) {
         append_profile_entry(
             self.buffer,
             &self.timestamp,
-            &meta.name,
-            meta.kind.profile(),
-            drain(meta.item),
+            metric_type,
+            name,
+            policy.spec(),
+            format,
+            snapshot,
         );
         if self.buffer.len() >= PROFILE_BUFFER_LIMIT {
             self.flush_buffer();
@@ -154,16 +249,18 @@ impl<'a> ProfileLogWriter<'a> {
 fn append_profile_entry(
     buffer: &mut Vec<u8>,
     timestamp: &str,
+    metric_type: &str,
     name: &str,
-    profile: ProfileSpec,
+    profile: MetricSpec,
+    format: ProfileFormat,
     snapshot: MetricSnapshot,
 ) {
-    match profile.log_format {
-        ProfileLogFormat::Resource => {
-            append_resource_entry(buffer, timestamp, name, profile, snapshot)
+    match format {
+        ProfileFormat::Resource => {
+            append_resource_entry(buffer, timestamp, metric_type, name, profile, snapshot)
         }
-        ProfileLogFormat::RpcServiceWhole => {
-            append_rpc_service_whole_entry(buffer, timestamp, name, profile, snapshot);
+        ProfileFormat::AccessStatistic => {
+            append_access_statistic_entry(buffer, timestamp, metric_type, name, profile, snapshot);
         }
     }
 }
@@ -171,14 +268,15 @@ fn append_profile_entry(
 fn append_resource_entry(
     buffer: &mut Vec<u8>,
     timestamp: &str,
+    metric_type: &str,
     name: &str,
-    profile: ProfileSpec,
+    profile: MetricSpec,
     snapshot: MetricSnapshot,
 ) {
     write!(
         buffer,
         "{timestamp} {{\"type\":\"{}\",\"name\":\"{}\",\"slowThreshold\":{},\"total_count\":{},\"error_count\":{},\"slow_count\":{},\"avg_time\":",
-        profile.label,
+        metric_type,
         name,
         profile.slow_threshold_ms,
         snapshot.total,
@@ -212,17 +310,18 @@ fn append_resource_average(buffer: &mut Vec<u8>, snapshot: MetricSnapshot) {
     }
 }
 
-fn append_rpc_service_whole_entry(
+fn append_access_statistic_entry(
     buffer: &mut Vec<u8>,
     timestamp: &str,
+    metric_type: &str,
     name: &str,
-    profile: ProfileSpec,
+    profile: MetricSpec,
     snapshot: MetricSnapshot,
 ) {
     write!(
         buffer,
         "{timestamp} {{\"type\":\"{}\",\"name\":\"{}\",\"slowThreshold\":\"{}\",\"total_count\":\"{}\",\"slow_count\":\"{}\",\"avg_time\":",
-        profile.label,
+        metric_type,
         name,
         profile.slow_threshold_ms,
         snapshot.total,

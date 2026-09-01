@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use metrics::{Metric, MetricSnapshot, MetricType, len, visit};
+use metrics::{Metric, MetricSnapshot, len, visit};
 
 fn register_sequential(c: &mut Criterion) {
     c.bench_function("register_sync_sequential", |b| {
@@ -10,7 +10,7 @@ fn register_sequential(c: &mut Criterion) {
         b.iter(|| {
             cnt = cnt.wrapping_add(1);
             let name = format!("seq_reg_metric_{cnt}");
-            let m = Metric::register(&name, MetricType::Redis);
+            let m = Metric::redis(&name);
             black_box(m);
         });
     });
@@ -30,7 +30,7 @@ fn register_concurrent(c: &mut Criterion) {
                     handles.push(std::thread::spawn(move || {
                         for i in 0..rounds {
                             let name = format!("conc_{workers}_{w}_{i}");
-                            let m = Metric::register(&name, MetricType::Redis);
+                            let m = Metric::redis(&name);
                             black_box(m);
                         }
                     }));
@@ -47,10 +47,7 @@ fn register_concurrent(c: &mut Criterion) {
 fn record_latency(c: &mut Criterion) {
     let mut metrics: Vec<Metric> = Vec::with_capacity(10_000);
     for i in 0..10_000usize {
-        metrics.push(Metric::register(
-            &format!("record_metric_{i}"),
-            MetricType::Redis,
-        ));
+        metrics.push(Metric::redis(&format!("record_metric_{i}")));
     }
 
     c.bench_function("record_sync", |b| {
@@ -106,12 +103,12 @@ fn registry_len_probe() {
 fn main_probe() {
     // quick manual smoke check for standalone `cargo run --bin metrics` if needed
     let start = Instant::now();
-    let a = Metric::register("probe", MetricType::Redis);
+    let a = Metric::redis("probe");
     a.record(Duration::from_millis(1), true);
     visit(|name, kind, s| {
         println!(
-            "{name} {:?} total={} success={} fail={} elapsed_ns={}",
-            kind, s.total, s.success, s.failure, s.elapsed_ns
+            "{name} {kind} total={} success={} fail={} elapsed_ns={}",
+            s.total, s.success, s.failure, s.elapsed_ns
         );
     });
     println!("probe done in {:?}", start.elapsed());
