@@ -2,6 +2,8 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::plan::{MetricPolicy, ProfileFormat};
+
 /// ProfileUtil counters for one metric.
 ///
 /// Profile output derives total from its interval buckets. Slow counts need a separate counter:
@@ -40,8 +42,17 @@ impl ItemPtr {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MetricType {
+pub(crate) enum MetricType {
+    /// Process logging counters such as bounded-queue drops.
+    Log,
     Redis,
+    Mc,
+    McDetail,
+    /// One outbound HTTP request, keyed by its stable endpoint URL.
+    Http,
+    /// Whole-request HTTP timing. The HTTP SDK registers this with an
+    /// `all_`-prefixed endpoint name to match the legacy profile contract.
+    HttpAll,
     /// ProfileUtil service metric. This uses the resource-shaped JSON fields
     /// but has the service slow threshold expected by legacy dashboards.
     Service,
@@ -49,51 +60,60 @@ pub enum MetricType {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct ProfileSpec {
-    pub(crate) label: &'static str,
+pub(crate) struct MetricSpec {
     pub(crate) slow_threshold_ms: u64,
     pub(crate) intervals_ms: [u64; 4],
-    pub(crate) log_format: ProfileLogFormat,
 }
 
 impl MetricType {
     #[inline]
-    pub(crate) fn profile(self) -> ProfileSpec {
+    pub(crate) fn policy(self) -> MetricPolicy {
         match self {
-            // ProfileUtil's REDIS resource buckets: <10, <50, <100, <200, >=200 ms.
-            Self::Redis => ProfileSpec {
-                label: "REDIS",
+            Self::Log | Self::Redis | Self::Mc | Self::McDetail | Self::Http => {
+                MetricPolicy::Resource
+            }
+            Self::HttpAll | Self::Service => MetricPolicy::Service,
+            Self::RpcServiceWhole => MetricPolicy::Access,
+        }
+    }
+
+    pub(crate) fn output(self) -> (&'static str, ProfileFormat) {
+        match self {
+            Self::Log => ("LOG", ProfileFormat::Resource),
+            Self::Redis => ("REDIS", ProfileFormat::Resource),
+            Self::Mc => ("MC", ProfileFormat::Resource),
+            Self::McDetail => ("MCDETAIL", ProfileFormat::Resource),
+            Self::Http | Self::HttpAll => ("HTTP", ProfileFormat::Resource),
+            Self::Service => ("SERVICE", ProfileFormat::Resource),
+            Self::RpcServiceWhole => ("RPC_SERVICE_WHOLE", ProfileFormat::AccessStatistic),
+        }
+    }
+}
+
+impl MetricPolicy {
+    #[inline]
+    pub(crate) fn spec(self) -> MetricSpec {
+        match self {
+            // ProfileUtil resource buckets: <10, <50, <100, <200, >=200 ms.
+            Self::Resource => MetricSpec {
                 slow_threshold_ms: 50,
                 intervals_ms: [10, 50, 100, 200],
-                log_format: ProfileLogFormat::Resource,
             },
-            // Java UserInfoServiceImpl.localMcHit/localMcSet use SERVICE with
-            // the same bucket layout as resource metrics and a 200 ms slow
-            // threshold.
-            Self::Service => ProfileSpec {
-                label: "SERVICE",
+            // Whole-request and SERVICE metrics retain resource buckets but use 200 ms slow.
+            Self::Service => MetricSpec {
                 slow_threshold_ms: 200,
                 intervals_ms: [10, 50, 100, 200],
-                log_format: ProfileLogFormat::Resource,
             },
-            // Access-statistic's RPC service whole-time buckets: <10, <50, <100, <500, >=500 ms.
-            Self::RpcServiceWhole => ProfileSpec {
-                label: "RPC_SERVICE_WHOLE",
+            // Access-statistic access buckets: <10, <50, <100, <500, >=500 ms.
+            Self::Access => MetricSpec {
                 slow_threshold_ms: 200,
                 intervals_ms: [10, 50, 100, 500],
-                log_format: ProfileLogFormat::RpcServiceWhole,
             },
         }
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum ProfileLogFormat {
-    Resource,
-    RpcServiceWhole,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MetricSnapshot {
     pub total: u64,
     pub success: u64,
@@ -107,12 +127,12 @@ pub struct MetricSnapshot {
 #[derive(Debug, Clone, Copy)]
 pub struct Metric {
     item: ItemPtr,
-    metric_type: MetricType,
+    policy: MetricPolicy,
 }
 
 impl Metric {
-    pub(crate) fn new(item: ItemPtr, metric_type: MetricType) -> Self {
-        Self { item, metric_type }
+    pub(crate) fn new(item: ItemPtr, policy: MetricPolicy) -> Self {
+        Self { item, policy }
     }
 
     /// Records a completed operation with nanosecond-precision input.
@@ -123,7 +143,7 @@ impl Metric {
     #[inline]
     pub fn record(&self, elapsed: Duration, success: bool) {
         let slot = self.item.as_ref();
-        let profile = self.metric_type.profile();
+        let profile = self.policy.spec();
         let elapsed_ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
 
         if !success {
@@ -150,6 +170,15 @@ impl Metric {
             _ => &slot.interval5,
         };
         interval.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one count-only occurrence without timing or failure data.
+    ///
+    /// The occurrence is represented in `total_count` and `interval1`; elapsed,
+    /// failure, and slow counters remain unchanged.
+    #[inline]
+    pub fn increment(&self) {
+        self.item.as_ref().interval1.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Returns an eventually-consistent snapshot without blocking `record`.
@@ -208,6 +237,17 @@ impl MetricSnapshot {
             elapsed_ns,
             slow,
             intervals,
+        }
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.total = self.total.saturating_add(other.total);
+        self.success = self.success.saturating_add(other.success);
+        self.failure = self.failure.saturating_add(other.failure);
+        self.elapsed_ns = self.elapsed_ns.saturating_add(other.elapsed_ns);
+        self.slow = self.slow.saturating_add(other.slow);
+        for (target, value) in self.intervals.iter_mut().zip(other.intervals) {
+            *target = target.saturating_add(value);
         }
     }
 }
