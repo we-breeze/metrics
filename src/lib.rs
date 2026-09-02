@@ -1,7 +1,7 @@
 //! Process-wide, append-only metrics with ProfileUtil-compatible periodic logging.
 //!
 //! Registration is sharded for concurrent service startup. `visit` is always available: it reads
-//! an immutable per-shard chunk index through `ds::Cow`, so it allocates nothing and never takes a
+//! an immutable per-shard chunk index through `ArcSwap`, so it allocates nothing and never takes a
 //! registration mutex. A new metadata chunk is published copy-on-write only once per 256 new
 //! metrics in the same shard.
 
@@ -568,17 +568,17 @@ mod tests {
     fn shard_index_changes_only_when_a_chunk_is_added() {
         let shard = registry::Shard::new();
         shard.register("metric.0", MetricType::Redis);
-        let first_index = shard.index_reader.get();
+        let first_index = shard.published_index.load();
 
         for index in 1..registry::CHUNK_SIZE {
             shard.register(&format!("metric.{index}"), MetricType::Redis);
         }
-        let full_index = shard.index_reader.get();
-        assert!(std::ptr::eq(&*first_index, &*full_index));
+        let full_index = shard.published_index.load();
+        assert!(Arc::ptr_eq(&first_index, &full_index));
 
         shard.register("metric.next_chunk", MetricType::Redis);
-        let next_index = shard.index_reader.get();
-        assert!(!std::ptr::eq(&*full_index, &*next_index));
+        let next_index = shard.published_index.load();
+        assert!(!Arc::ptr_eq(&full_index, &next_index));
         assert_eq!(next_index.chunks.len(), 2);
     }
 

@@ -3,7 +3,7 @@ use crate::metric::{ItemPtr, Metric, MetricSnapshot, Slot, snapshot};
 use crate::plan::{MetricPolicy, ProfileMeta, ProfilePlan};
 use crate::state::{StateRegistry, StateSnapshot, StateType};
 use ahash::RandomState;
-use ds::{CowReadHandle, CowWriteHandle, cow};
+use arc_swap::ArcSwap;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
@@ -103,20 +103,16 @@ struct ShardState {
     slots: Vec<Box<[Slot; CHUNK_SIZE]>>,
     meta_chunks: Vec<Arc<MetaChunk>>,
     len: usize,
-    /// `ds::Cow` is a single-writer structure. The containing shard mutex supplies that writer
-    /// serialization without introducing a global registration lock.
-    index_writer: CowWriteHandle<ShardIndex>,
 }
 
 impl ShardState {
-    fn new(index_writer: CowWriteHandle<ShardIndex>) -> Self {
+    fn new() -> Self {
         Self {
             by_type: FastHashMap::default(),
             by_profile: FastHashMap::default(),
             slots: Vec::new(),
             meta_chunks: Vec::new(),
             len: 0,
-            index_writer,
         }
     }
 
@@ -128,7 +124,12 @@ impl ShardState {
         self.by_profile.get(&policy)?.get(identity).copied()
     }
 
-    fn allocate(&mut self, profile: ProfileMeta, policy: MetricPolicy) -> (Metric, ItemPtr) {
+    fn allocate(
+        &mut self,
+        published_index: &ArcSwap<ShardIndex>,
+        profile: ProfileMeta,
+        policy: MetricPolicy,
+    ) -> (Metric, ItemPtr) {
         let index = self.len;
         let chunk_index = index / CHUNK_SIZE;
         let offset = index % CHUNK_SIZE;
@@ -157,26 +158,35 @@ impl ShardState {
             let index = ShardIndex {
                 chunks: Arc::from(self.meta_chunks.clone().into_boxed_slice()),
             };
-            self.index_writer.update(index);
+            published_index.store(Arc::new(index));
         }
 
         (Metric::new(item, policy), item)
     }
 
-    fn insert(&mut self, name: Arc<str>, kind: MetricType) -> Metric {
+    fn insert(
+        &mut self,
+        published_index: &ArcSwap<ShardIndex>,
+        name: Arc<str>,
+        kind: MetricType,
+    ) -> Metric {
         let profile = ProfileMeta::Single {
             name: Arc::clone(&name),
             kind,
         };
-        let (metric, item) = self.allocate(profile, kind.policy());
+        let (metric, item) = self.allocate(published_index, profile, kind.policy());
         self.by_type.entry(kind).or_default().insert(name, item);
         metric
     }
 
-    fn insert_profile(&mut self, plan: Arc<ProfilePlan>) -> Metric {
+    fn insert_profile(
+        &mut self,
+        published_index: &ArcSwap<ShardIndex>,
+        plan: Arc<ProfilePlan>,
+    ) -> Metric {
         let identity = Arc::clone(&plan.identity);
         let policy = plan.policy;
-        let (metric, item) = self.allocate(ProfileMeta::Fanout(plan), policy);
+        let (metric, item) = self.allocate(published_index, ProfileMeta::Fanout(plan), policy);
         self.by_profile
             .entry(policy)
             .or_default()
@@ -189,15 +199,14 @@ impl ShardState {
 #[repr(align(64))]
 pub(crate) struct Shard {
     state: Mutex<ShardState>,
-    pub(crate) index_reader: CowReadHandle<ShardIndex>,
+    pub(crate) published_index: ArcSwap<ShardIndex>,
 }
 
 impl Shard {
     pub(crate) fn new() -> Self {
-        let (index_writer, index_reader) = cow(ShardIndex::empty());
         Self {
-            state: Mutex::new(ShardState::new(index_writer)),
-            index_reader,
+            state: Mutex::new(ShardState::new()),
+            published_index: ArcSwap::from_pointee(ShardIndex::empty()),
         }
     }
 
@@ -206,7 +215,7 @@ impl Shard {
         if let Some(item) = state.existing(name, kind) {
             return Metric::new(item, kind.policy());
         }
-        state.insert(Arc::from(name), kind)
+        state.insert(&self.published_index, Arc::from(name), kind)
     }
 
     pub(crate) fn register_profile(&self, plan: ProfilePlan) -> Metric {
@@ -214,7 +223,7 @@ impl Shard {
         if let Some(item) = state.existing_profile(&plan.identity, plan.policy) {
             return Metric::new(item, plan.policy);
         }
-        state.insert_profile(Arc::new(plan))
+        state.insert_profile(&self.published_index, Arc::new(plan))
     }
 }
 
@@ -269,7 +278,7 @@ impl Registry {
         self.shards
             .iter()
             .map(|shard| {
-                let index = shard.index_reader.get();
+                let index = shard.published_index.load();
                 index
                     .chunks
                     .iter()
@@ -281,8 +290,8 @@ impl Registry {
 
     pub(crate) fn for_each_meta(&self, mut f: impl FnMut(&MetricMeta)) {
         for shard in &self.shards {
-            // `get` clones the immutable Arc index; it does not allocate or hold the shard mutex.
-            let index = shard.index_reader.get();
+            // The ArcSwap guard protects the immutable index without allocation or the shard mutex.
+            let index = shard.published_index.load();
             for chunk in index.chunks.iter() {
                 // A visitor intentionally observes a stable prefix of each chunk. A concurrent
                 // registration may become visible in this visit or the next one, never as an

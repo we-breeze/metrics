@@ -5,7 +5,7 @@ Minimal in-crate metric registry focused on:
 - sharded, synchronous registration during service startup
 - fixed `Slot` layout with six `AtomicU64` counters
 - lock-free record path
-- allocation-free periodic visit at every lifecycle stage, using `ds::Cow`
+- allocation-free periodic visit at every lifecycle stage, using `ArcSwap`
 - keyed AHash routing and lookup for long metric names
 
 ## API

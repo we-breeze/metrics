@@ -7,8 +7,8 @@ license = "Apache-2.0"
 
 [dependencies]
 ahash = "0.8"
+arc-swap = "1.9.2"
 chrono = "0.4"
-ds = { path = "../ds" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
