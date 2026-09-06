@@ -58,6 +58,11 @@ impl Metric {
         Self::register_single(name, metric::MetricType::Redis)
     }
 
+    /// Registers one MySQL host and operation metric.
+    pub fn mysql(name: &str) -> Self {
+        Self::register_single(name, metric::MetricType::Mysql)
+    }
+
     /// Registers one Memcache port-level metric.
     pub fn mc(name: &str) -> Self {
         Self::register_single(name, metric::MetricType::Mc)
@@ -76,6 +81,11 @@ impl Metric {
     /// Registers the `all_`-prefixed whole-request HTTP metric.
     pub fn http_all(name: &str) -> Self {
         Self::register_single(name, metric::MetricType::HttpAll)
+    }
+
+    /// Registers an inbound API metric with the service latency policy.
+    pub fn api(name: &str) -> Self {
+        Self::register_single(name, metric::MetricType::Api)
     }
 
     /// Registers a service metric with the legacy 200 ms slow threshold.
