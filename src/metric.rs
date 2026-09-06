@@ -46,6 +46,7 @@ pub(crate) enum MetricType {
     /// Process logging counters such as bounded-queue drops.
     Log,
     Redis,
+    Mysql,
     Mc,
     McDetail,
     /// One outbound HTTP request, keyed by its stable endpoint URL.
@@ -53,6 +54,8 @@ pub(crate) enum MetricType {
     /// Whole-request HTTP timing. The HTTP SDK registers this with an
     /// `all_`-prefixed endpoint name to match the legacy profile contract.
     HttpAll,
+    /// One inbound API route and HTTP status class.
+    Api,
     /// ProfileUtil service metric. This uses the resource-shaped JSON fields
     /// but has the service slow threshold expected by legacy dashboards.
     Service,
@@ -69,10 +72,10 @@ impl MetricType {
     #[inline]
     pub(crate) fn policy(self) -> MetricPolicy {
         match self {
-            Self::Log | Self::Redis | Self::Mc | Self::McDetail | Self::Http => {
+            Self::Log | Self::Redis | Self::Mysql | Self::Mc | Self::McDetail | Self::Http => {
                 MetricPolicy::Resource
             }
-            Self::HttpAll | Self::Service => MetricPolicy::Service,
+            Self::HttpAll | Self::Service | Self::Api => MetricPolicy::Service,
             Self::RpcServiceWhole => MetricPolicy::Access,
         }
     }
@@ -81,9 +84,11 @@ impl MetricType {
         match self {
             Self::Log => ("LOG", ProfileFormat::Resource),
             Self::Redis => ("REDIS", ProfileFormat::Resource),
+            Self::Mysql => ("MYSQL", ProfileFormat::Resource),
             Self::Mc => ("MC", ProfileFormat::Resource),
             Self::McDetail => ("MCDETAIL", ProfileFormat::Resource),
             Self::Http | Self::HttpAll => ("HTTP", ProfileFormat::Resource),
+            Self::Api => ("API", ProfileFormat::Resource),
             Self::Service => ("SERVICE", ProfileFormat::Resource),
             Self::RpcServiceWhole => ("RPC_SERVICE_WHOLE", ProfileFormat::AccessStatistic),
         }

@@ -10,7 +10,7 @@ Minimal in-crate metric registry focused on:
 
 ## API
 
-- `Metric::register(name, kind) -> Metric`
+- Typed constructors such as `Metric::redis(name)`, `Metric::http(name)`, and `Metric::api(name)`
 - `metric.record(elapsed: Duration, success)`
 - `metrics::visit(|name, kind, snapshot| { ... })`
 
@@ -19,10 +19,16 @@ only its per-chunk length; adding a new chunk copy-on-writes that shard's chunk-
 `visit` sees per-shard published prefixes, so a concurrent registration is observed either in the
 current traversal or the next one, never as uninitialized metadata.
 
-The first `Metric::register` starts a 10-second background profile logger. It drains interval
+The first metric registration starts a 10-second background profile logger. It drains interval
 counters and appends ProfileUtil-compatible lines to `../logs/profile.log`; timestamps
 use the `+08:00` clock but intentionally have no timezone suffix. Set
 `BREEZE_PROFILE_LOG_PATH` before the first registration to override the path.
 
 `Slot` stores error, elapsed-nanosecond sum, and five latency buckets. `total` and `slow` are
 derived from the buckets; `success` is derived as `total - error` in snapshots.
+
+`Metric::api(name)` emits profile type `API`, with the service latency policy
+(200 ms slow threshold). HTTP server API exports register four names per route
+template: `<path>_2xx`, `<path>_3xx`, `<path>_4xx`, and `<path>_5xx`.
+
+MySQL 客户端使用 `Metric::mysql(name)` 注册 `MYSQL` 类型指标，按 host 和 get/list/update/transaction 操作聚合，沿用资源指标的 50ms 慢调用阈值。
