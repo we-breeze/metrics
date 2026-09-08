@@ -1,4 +1,4 @@
-# metrics
+# brz-metrics
 
 Minimal in-crate metric registry focused on:
 
@@ -45,3 +45,50 @@ but escaping does not redact sensitive values.
 Configure a log directory writable only by the service account and rotate the
 profile log externally. The logger follows the configured filesystem path and
 does not enforce a disk quota or rotate files itself.
+
+## Installation
+
+After the first successful publish, use the package with the existing Rust
+library name:
+
+```toml
+[dependencies]
+metrics = { package = "brz-metrics", version = "0.0.3" }
+```
+
+## CI and publishing
+
+Pushes and pull requests run rustfmt, Clippy with warnings denied, all test
+and benchmark targets in test mode, and release-mode library tests. This crate
+has no Loom models; its concurrent registration and traversal tests run in
+both debug and release modes.
+
+Before publishing:
+
+1. Grant this repository access to the `we-breeze` organization Actions secret
+   `CARGO_REGISTRY_TOKEN`, or configure a repository secret with the same name.
+   The token must allow creating and publishing `brz-metrics`; the first publish
+   creates the crate automatically. Organization secrets shared with public
+   repositories are available to this public repository.
+2. Ensure repository rules allow Actions to push version commits to `main`
+   and create release tags. Publish requests `contents: write` permission.
+3. Push these workflow files to the GitHub default branch, `main`.
+
+Use **Actions → Publish → Run workflow**, select `main`, and leave `retry_tag`
+empty for a new release. Merging or pushing code only runs CI; publishing is
+manual. Publish increments the greatest `v0.0.x` tag, updates Cargo.toml and
+Cargo.lock, runs checks and `cargo publish --dry-run`, atomically pushes the
+release commit and annotated tag, then uploads to crates.io. With existing
+`v0.0.1` and `v0.0.2` tags, the first new release will be `v0.0.3`. The initial
+unpublished Cargo version `0.1.0` is replaced by this sequence.
+
+Publishing is serialized and rejects stale checkouts. If an upload fails after
+the tag is pushed, start a new Publish run and set `retry_tag` to that existing
+tag. Do not enter a new version in this field: it only retries an existing
+release with matching Cargo metadata. Check crates.io before retrying an
+upload timeout; published versions cannot be overwritten. Source fixes require
+a new release. No GitHub Release is created.
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE-APACHE](LICENSE-APACHE).

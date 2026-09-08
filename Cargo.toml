@@ -1,9 +1,14 @@
 [package]
-name = "metrics"
+name = "brz-metrics"
 version = "0.1.0"
 edition = "2024"
 description = "lightweight high-concurrency metric slot registry"
 license = "Apache-2.0"
+repository = "https://github.com/we-breeze/metrics"
+readme = "README.md"
+
+[lib]
+name = "metrics"
 
 [dependencies]
 ahash = "0.8"
