@@ -26,20 +26,21 @@ pub(crate) struct MetricMeta {
 /// Entries are written once, in increasing order. `published_len` is the release/acquire boundary
 /// that prevents visitors from touching a not-yet-initialized entry.
 pub(crate) struct MetaChunk {
-    entries: UnsafeCell<[MaybeUninit<MetricMeta>; CHUNK_SIZE]>,
+    entries: [UnsafeCell<MaybeUninit<MetricMeta>>; CHUNK_SIZE],
     published_len: AtomicUsize,
 }
 
 // Safety: writers initialize each entry exactly once before publishing its index with a Release
 // store. Readers load the prefix length with Acquire and never access an entry beyond that prefix.
-// Once initialized, an entry is immutable. The sole writer for a chunk is serialized by its shard
+// Each entry has its own UnsafeCell, so references to published entries never cover
+// a different entry being initialized concurrently. Once initialized, an entry is immutable. The sole writer for a chunk is serialized by its shard
 // mutex, so no two writers access the same entry.
 unsafe impl Sync for MetaChunk {}
 
 impl MetaChunk {
     fn new() -> Self {
         Self {
-            entries: UnsafeCell::new(std::array::from_fn(|_| MaybeUninit::uninit())),
+            entries: std::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit())),
             published_len: AtomicUsize::new(0),
         }
     }
@@ -51,7 +52,7 @@ impl MetaChunk {
         // Safety: see `Sync` above. This slot is currently outside the published prefix and is
         // assigned by only this shard's serialized writer.
         unsafe {
-            (*self.entries.get())[offset].as_mut_ptr().write(meta);
+            (*self.entries[offset].get()).as_mut_ptr().write(meta);
         }
         self.published_len.store(offset + 1, Ordering::Release);
     }
@@ -66,7 +67,7 @@ impl MetaChunk {
         debug_assert!(offset < self.published_len());
         // Safety: `visit` accesses only offsets below an Acquire-loaded published prefix. Such an
         // entry was fully initialized before the corresponding Release store and is immutable.
-        unsafe { (&*self.entries.get())[offset].assume_init_ref() }
+        unsafe { (&*self.entries[offset].get()).assume_init_ref() }
     }
 }
 
@@ -75,7 +76,7 @@ impl Drop for MetaChunk {
         let published = self.published_len.load(Ordering::Relaxed);
         for offset in 0..published {
             // Safety: every offset below `published_len` was initialized by `publish`.
-            unsafe { (*self.entries.get())[offset].assume_init_drop() };
+            unsafe { self.entries[offset].get_mut().assume_init_drop() };
         }
     }
 }

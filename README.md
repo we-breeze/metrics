@@ -23,6 +23,7 @@ The first metric registration starts a 10-second background profile logger. It d
 counters and appends ProfileUtil-compatible lines to `../logs/profile.log`; timestamps
 use the `+08:00` clock but intentionally have no timezone suffix. Set
 `BREEZE_PROFILE_LOG_PATH` before the first registration to override the path.
+The default path is relative to the process working directory.
 
 `Slot` stores error, elapsed-nanosecond sum, and five latency buckets. `total` and `slow` are
 derived from the buckets; `success` is derived as `total - error` in snapshots.
@@ -32,3 +33,15 @@ derived from the buckets; `success` is derived as `total - error` in snapshots.
 template: `<path>_2xx`, `<path>_3xx`, `<path>_4xx`, and `<path>_5xx`.
 
 MySQL 客户端使用 `Metric::mysql(name)` 注册 `MYSQL` 类型指标，按 host 和 get/list/update/transaction 操作聚合，沿用资源指标的 50ms 慢调用阈值。
+
+## Operational safety
+
+Use stable, bounded metric names such as route templates. The process-wide
+registry retains metric names and RPC state keys for the lifetime of the
+process; raw URLs, user IDs, or arbitrary request values can cause unbounded
+memory growth and disclose data in logs. JSON strings are escaped when written,
+but escaping does not redact sensitive values.
+
+Configure a log directory writable only by the service account and rotate the
+profile log externally. The logger follows the configured filesystem path and
+does not enforce a disk quota or rotate files itself.

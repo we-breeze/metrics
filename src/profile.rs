@@ -164,17 +164,17 @@ impl<'a> ProfileLogWriter<'a> {
         if self.error.is_some() {
             return;
         }
-        write!(
+        append_entry_header(
             self.buffer,
-            "{} {{\"type\":\"{}\",\"name\":\"{}\"",
-            self.timestamp,
+            &self.timestamp,
             state.state_type.profile_type(),
-            state.name,
-        )
-        .expect("writing to a Vec<u8> cannot fail");
+            &state.name,
+        );
         for (key, value) in &state.fields {
-            write!(self.buffer, ",\"{key}\":\"{value}\"")
-                .expect("writing to a Vec<u8> cannot fail");
+            self.buffer.push(b',');
+            append_json_string(self.buffer, key);
+            self.buffer.push(b':');
+            append_json_string(self.buffer, value);
         }
         writeln!(self.buffer, "}}").expect("writing to a Vec<u8> cannot fail");
         if self.buffer.len() >= PROFILE_BUFFER_LIMIT {
@@ -246,6 +246,18 @@ impl<'a> ProfileLogWriter<'a> {
     }
 }
 
+/// Serialize every caller-provided string so it cannot inject fields or log lines.
+fn append_json_string(buffer: &mut Vec<u8>, value: &str) {
+    serde_json::to_writer(buffer, value).expect("writing a JSON string to a Vec<u8> cannot fail");
+}
+
+fn append_entry_header(buffer: &mut Vec<u8>, timestamp: &str, metric_type: &str, name: &str) {
+    write!(buffer, "{timestamp} {{\"type\":").expect("writing to a Vec<u8> cannot fail");
+    append_json_string(buffer, metric_type);
+    buffer.extend_from_slice(b",\"name\":");
+    append_json_string(buffer, name);
+}
+
 fn append_profile_entry(
     buffer: &mut Vec<u8>,
     timestamp: &str,
@@ -273,11 +285,10 @@ fn append_resource_entry(
     profile: MetricSpec,
     snapshot: MetricSnapshot,
 ) {
+    append_entry_header(buffer, timestamp, metric_type, name);
     write!(
         buffer,
-        "{timestamp} {{\"type\":\"{}\",\"name\":\"{}\",\"slowThreshold\":{},\"total_count\":{},\"error_count\":{},\"slow_count\":{},\"avg_time\":",
-        metric_type,
-        name,
+        ",\"slowThreshold\":{},\"total_count\":{},\"error_count\":{},\"slow_count\":{},\"avg_time\":",
         profile.slow_threshold_ms,
         snapshot.total,
         snapshot.failure,
@@ -318,14 +329,11 @@ fn append_access_statistic_entry(
     profile: MetricSpec,
     snapshot: MetricSnapshot,
 ) {
+    append_entry_header(buffer, timestamp, metric_type, name);
     write!(
         buffer,
-        "{timestamp} {{\"type\":\"{}\",\"name\":\"{}\",\"slowThreshold\":\"{}\",\"total_count\":\"{}\",\"slow_count\":\"{}\",\"avg_time\":",
-        metric_type,
-        name,
-        profile.slow_threshold_ms,
-        snapshot.total,
-        snapshot.slow,
+        ",\"slowThreshold\":\"{}\",\"total_count\":\"{}\",\"slow_count\":\"{}\",\"avg_time\":",
+        profile.slow_threshold_ms, snapshot.total, snapshot.slow,
     )
     .expect("writing to a Vec<u8> cannot fail");
     if snapshot.total == 0 {

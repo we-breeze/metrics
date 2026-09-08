@@ -399,10 +399,7 @@ mod tests {
     #[test]
     fn http_profile_uses_endpoint_and_whole_request_thresholds() {
         let registry = Registry::new();
-        let endpoint = registry.register(
-            "http://service.example.com/api/config",
-            MetricType::Http,
-        );
+        let endpoint = registry.register("http://service.example.com/api/config", MetricType::Http);
         let whole = registry.register(
             "all_http://service.example.com/api/config",
             MetricType::HttpAll,
@@ -546,6 +543,65 @@ mod tests {
             "\"interval1\":\"0\",\"interval2\":\"2\""
         )));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn profile_strings_round_trip_without_injecting_json_or_log_lines() {
+        use crate::plan::{MetricPolicy, ProfileFormat, ProfilePlan};
+
+        let registry = Registry::new();
+        let hostile = format!(
+            "quoted\"\\ unicode-测试 {}\n{{\"type\":\"FORGED\"}}",
+            (0u8..=31).map(char::from).collect::<String>()
+        );
+        for (identity, policy, format) in [
+            ("resource", MetricPolicy::Resource, ProfileFormat::Resource),
+            (
+                "access",
+                MetricPolicy::Access,
+                ProfileFormat::AccessStatistic,
+            ),
+        ] {
+            registry
+                .register_profile(ProfilePlan::new(
+                    identity, policy, format, &*hostile, &*hostile,
+                ))
+                .increment();
+        }
+        registry.record_state(StateType::Rpc, &hostile, &hostile, &hostile);
+        let directory = std::env::temp_dir().join(format!(
+            "metrics-json-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("profile.log");
+        let timestamp = FixedOffset::east_opt(profile::SHANGHAI_OFFSET_SECONDS)
+            .unwrap()
+            .with_ymd_and_hms(2026, 9, 8, 12, 0, 0)
+            .single()
+            .unwrap();
+        registry
+            .write_profile_log(&path, timestamp, &mut Vec::new())
+            .unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let rows: Vec<serde_json::Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(&line[20..]).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 4);
+        for row in &rows[..2] {
+            assert_eq!(row["type"], hostile);
+            assert_eq!(row["name"], hostile);
+        }
+        assert_eq!(rows[2]["type"], "MOTAN_CLUSTER_STAT");
+        assert_eq!(rows[2]["name"], hostile);
+        assert_eq!(rows[2][&hostile], hostile);
+        assert_eq!(rows[3]["name"], "other://profile_baseline");
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
