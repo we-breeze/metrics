@@ -8,7 +8,7 @@ repository = "https://github.com/we-breeze/metrics"
 readme = "README.md"
 
 [lib]
-name = "metrics"
+name = "brz_metrics"
 
 [dependencies]
 ahash = "0.8"

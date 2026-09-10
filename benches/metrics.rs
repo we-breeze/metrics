@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use metrics::{Metric, MetricSnapshot, len, visit};
+use brz_metrics::{Metric, MetricSnapshot, len, visit};
 
 fn register_sequential(c: &mut Criterion) {
     c.bench_function("register_sync_sequential", |b| {

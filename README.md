@@ -12,7 +12,7 @@ Minimal in-crate metric registry focused on:
 
 - Typed constructors such as `Metric::redis(name)`, `Metric::http(name)`, and `Metric::api(name)`
 - `metric.record(elapsed: Duration, success)`
-- `metrics::visit(|name, kind, snapshot| { ... })`
+- `brz_metrics::visit(|name, kind, snapshot| { ... })`
 
 Each shard appends metadata into 256-item chunks. Adding an item to an existing chunk publishes
 only its per-chunk length; adding a new chunk copy-on-writes that shard's chunk-pointer index.
@@ -53,7 +53,7 @@ library name:
 
 ```toml
 [dependencies]
-metrics = { package = "brz-metrics", version = "0.0.3" }
+brz-metrics = "0.0.4"
 ```
 
 ## CI and publishing
@@ -92,3 +92,14 @@ a new release. No GitHub Release is created.
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE-APACHE](LICENSE-APACHE).
+
+## Crate naming
+
+The package name is `brz-metrics`; the Rust library name is `brz_metrics`.
+Use `brz_metrics::...` in Rust code. This replaces the previous `metrics`
+library name. Existing explicit dependency aliases remain supported.
+
+```toml
+[dependencies]
+brz-metrics = "0.0.4"
+```
