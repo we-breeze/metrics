@@ -6,6 +6,10 @@ description = "lightweight high-concurrency metric slot registry"
 license = "Apache-2.0"
 repository = "https://github.com/we-breeze/metrics"
 readme = "README.md"
+# `brz-metrics` owns one process-global registry. Keep Cargo from resolving
+# multiple versions of this crate into the same final binary.
+links = "brz_metrics_registry"
+build = "build.rs"
 
 [lib]
 name = "brz_metrics"
