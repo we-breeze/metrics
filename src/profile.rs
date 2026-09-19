@@ -111,9 +111,12 @@ impl<'a> ProfileLogWriter<'a> {
             return;
         }
 
-        // `swap(0)` keeps the interval accounting lossless. A record racing this drain can have
-        // fields split across adjacent intervals, but each individual counter is emitted once.
+        // `swap(0)` keeps the interval accounting lossless. Empty interval rows
+        // add no profile value, so omit them from the log.
         let snapshot = drain(meta.item);
+        if snapshot.total == 0 {
+            return;
+        }
         match &meta.profile {
             ProfileMeta::Single { name, kind } => {
                 let (metric_type, format) = kind.output();

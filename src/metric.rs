@@ -51,11 +51,14 @@ pub(crate) enum MetricType {
     McDetail,
     /// One outbound HTTP request, keyed by its stable endpoint URL.
     Http,
-    /// Whole-request HTTP timing. The HTTP SDK registers this with an
-    /// `all_`-prefixed endpoint name to match the legacy profile contract.
+    /// Whole-request HTTP timing, including response-body consumption.
     HttpAll,
     /// One inbound API route and HTTP status class.
     Api,
+    Api3xx,
+    Api4xx,
+    Api5xx,
+    ApiTimeout,
     /// ProfileUtil service metric. This uses the resource-shaped JSON fields
     /// but has the service slow threshold expected by legacy dashboards.
     Service,
@@ -75,7 +78,13 @@ impl MetricType {
             Self::Log | Self::Redis | Self::Mysql | Self::Mc | Self::McDetail | Self::Http => {
                 MetricPolicy::Resource
             }
-            Self::HttpAll | Self::Service | Self::Api => MetricPolicy::Service,
+            Self::HttpAll
+            | Self::Service
+            | Self::Api
+            | Self::Api3xx
+            | Self::Api4xx
+            | Self::Api5xx
+            | Self::ApiTimeout => MetricPolicy::Service,
             Self::RpcServiceWhole => MetricPolicy::Access,
         }
     }
@@ -89,6 +98,10 @@ impl MetricType {
             Self::McDetail => ("MCDETAIL", ProfileFormat::Resource),
             Self::Http | Self::HttpAll => ("HTTP", ProfileFormat::Resource),
             Self::Api => ("API", ProfileFormat::Resource),
+            Self::Api3xx => ("API3XX", ProfileFormat::Resource),
+            Self::Api4xx => ("API4XX", ProfileFormat::Resource),
+            Self::Api5xx => ("API5XX", ProfileFormat::Resource),
+            Self::ApiTimeout => ("APITO", ProfileFormat::Resource),
             Self::Service => ("SERVICE", ProfileFormat::Resource),
             Self::RpcServiceWhole => ("RPC_SERVICE_WHOLE", ProfileFormat::AccessStatistic),
         }
