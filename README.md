@@ -24,13 +24,15 @@ counters and appends ProfileUtil-compatible lines to `../logs/profile.log`; time
 use the `+08:00` clock but intentionally have no timezone suffix. Set
 `BREEZE_PROFILE_LOG_PATH` before the first registration to override the path.
 The default path is relative to the process working directory.
+Metric rows whose current interval has `total_count == 0` are not written.
+State rows and the fixed baseline liveness row are still written every interval.
 
 `Slot` stores error, elapsed-nanosecond sum, and five latency buckets. `total` and `slow` are
 derived from the buckets; `success` is derived as `total - error` in snapshots.
 
-`Metric::api(name)` emits profile type `API`, with the service latency policy
-(200 ms slow threshold). HTTP server API exports register four names per route
-template: `<path>_2xx`, `<path>_3xx`, `<path>_4xx`, and `<path>_5xx`.
+HTTP server route metrics use profile types `API`, `API3XX`, `API4XX`,
+`API5XX`, and `APITO`, all with the unmodified route template as `name` and the
+service latency policy (200 ms slow threshold). `API` represents 2xx responses.
 
 MySQL 客户端使用 `Metric::mysql(name)` 注册 `MYSQL` 类型指标，按 host 和 get/list/update/transaction 操作聚合，沿用资源指标的 50ms 慢调用阈值。
 

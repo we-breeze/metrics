@@ -78,7 +78,7 @@ impl Metric {
         Self::register_single(name, metric::MetricType::Http)
     }
 
-    /// Registers the `all_`-prefixed whole-request HTTP metric.
+    /// Registers a whole-request HTTP metric using the supplied name.
     pub fn http_all(name: &str) -> Self {
         Self::register_single(name, metric::MetricType::HttpAll)
     }
@@ -86,6 +86,26 @@ impl Metric {
     /// Registers an inbound API metric with the service latency policy.
     pub fn api(name: &str) -> Self {
         Self::register_single(name, metric::MetricType::Api)
+    }
+
+    /// Registers an inbound API 3xx metric using the route template as name.
+    pub fn api_3xx(name: &str) -> Self {
+        Self::register_single(name, metric::MetricType::Api3xx)
+    }
+
+    /// Registers an inbound API 4xx metric using the route template as name.
+    pub fn api_4xx(name: &str) -> Self {
+        Self::register_single(name, metric::MetricType::Api4xx)
+    }
+
+    /// Registers an inbound API 5xx metric using the route template as name.
+    pub fn api_5xx(name: &str) -> Self {
+        Self::register_single(name, metric::MetricType::Api5xx)
+    }
+
+    /// Registers an inbound API timeout metric using the route template as name.
+    pub fn api_timeout(name: &str) -> Self {
+        Self::register_single(name, metric::MetricType::ApiTimeout)
     }
 
     /// Registers a service metric with the legacy 200 ms slow threshold.
@@ -243,15 +263,9 @@ mod tests {
             .unwrap();
         let content = fs::read_to_string(&path).unwrap();
         let lines: Vec<_> = content.lines().collect();
-        assert_eq!(
-            lines[2],
-            concat!(
-                "2026-08-13 17:34:18 ",
-                "{\"type\":\"REDIS\",\"name\":\"cache.metric\",\"slowThreshold\":50,",
-                "\"total_count\":0,\"error_count\":0,\"slow_count\":0,\"avg_time\":0.0,",
-                "\"interval1\":0,\"interval2\":0,\"interval3\":0,\"interval4\":0,\"interval5\":0}",
-            )
-        );
+        assert_eq!(lines.len(), 3);
+        assert!(!content.contains("\"total_count\":0"));
+        assert!(lines[2].contains("\"name\":\"other://profile_baseline\""));
         assert!(buffer.capacity() >= profile::PROFILE_BUFFER_LIMIT);
         fs::remove_file(path).unwrap();
     }
