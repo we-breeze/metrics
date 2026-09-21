@@ -27,6 +27,13 @@ The default path is relative to the process working directory.
 Metric rows whose current interval has `total_count == 0` are not written.
 State rows and the fixed baseline liveness row are still written every interval.
 
+Profile log rotation is disabled by default. Set `BREEZE_PROFILE_LOG_ROTATION=hourly`
+before the first metric registration to enable hourly rotation. The active file keeps
+the configured name, while completed UTC+8 hours are archived with names such as
+`profile.log.20260921-00`; the UTC+8 offset is not included in the file name. Rotation
+does not delete or compress archives. If an archive name already exists, a numeric
+suffix such as `.1` is appended instead of overwriting it.
+
 `Slot` stores error, elapsed-nanosecond sum, and five latency buckets. `total` and `slow` are
 derived from the buckets; `success` is derived as `total - error` in snapshots.
 
@@ -44,9 +51,9 @@ process; raw URLs, user IDs, or arbitrary request values can cause unbounded
 memory growth and disclose data in logs. JSON strings are escaped when written,
 but escaping does not redact sensitive values.
 
-Configure a log directory writable only by the service account and rotate the
-profile log externally. The logger follows the configured filesystem path and
-does not enforce a disk quota or rotate files itself.
+Configure a log directory writable only by the service account. The logger follows
+the configured filesystem path and does not enforce a disk quota or delete old files.
+Leave built-in rotation disabled if an external log rotator manages the file.
 
 ## Installation
 

@@ -8,6 +8,7 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
@@ -15,6 +16,7 @@ use std::time::Duration;
 const PROFILE_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_PROFILE_LOG_PATH: &str = "../logs/profile.log";
 const PROFILE_LOG_PATH_ENV: &str = "BREEZE_PROFILE_LOG_PATH";
+const PROFILE_LOG_ROTATION_ENV: &str = "BREEZE_PROFILE_LOG_ROTATION";
 pub(crate) const PROFILE_BUFFER_LIMIT: usize = 1024 * 1024;
 pub(crate) const SHANGHAI_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 
@@ -23,17 +25,31 @@ static PROFILE_LOGGER_STARTED: OnceLock<()> = OnceLock::new();
 pub(crate) fn start_default_profile_logger(registry: &'static Registry) {
     PROFILE_LOGGER_STARTED.get_or_init(|| {
         let path = profile_log_path();
+        let rotation = profile_log_rotation();
         if let Err(error) = thread::Builder::new()
             .name("metrics-profile-log".to_owned())
             .spawn(move || {
                 let mut buffer = Vec::with_capacity(PROFILE_BUFFER_LIMIT);
+                let mut log_file = ProfileLogFile::new(path, rotation);
+                let offset = FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS)
+                    .expect("+08:00 must be a valid fixed offset");
                 loop {
                     thread::sleep(PROFILE_INTERVAL);
-                    let offset = FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS)
-                        .expect("+08:00 must be a valid fixed offset");
                     let timestamp = Utc::now().with_timezone(&offset);
-                    if let Err(error) = registry.write_profile_log(&path, timestamp, &mut buffer) {
-                        eprintln!("metrics: failed to write {}: {error}", path.display());
+                    if let Err(error) = log_file.rotate_if_needed(timestamp) {
+                        eprintln!(
+                            "metrics: failed to rotate {}: {error}",
+                            log_file.path().display()
+                        );
+                        continue;
+                    }
+                    if let Err(error) =
+                        registry.write_profile_log(log_file.path(), timestamp, &mut buffer)
+                    {
+                        eprintln!(
+                            "metrics: failed to write {}: {error}",
+                            log_file.path().display()
+                        );
                     }
                 }
             })
@@ -48,6 +64,153 @@ fn profile_log_path() -> PathBuf {
         .filter(|path| !path.is_empty())
         .map(Into::into)
         .unwrap_or_else(|| DEFAULT_PROFILE_LOG_PATH.into())
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ProfileLogRotation {
+    #[default]
+    Never,
+    Hourly,
+}
+
+impl FromStr for ProfileLogRotation {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "never" => Ok(Self::Never),
+            "hourly" => Ok(Self::Hourly),
+            _ => Err(format!(
+                "unsupported profile log rotation policy {value:?}; expected never or hourly"
+            )),
+        }
+    }
+}
+
+fn profile_log_rotation() -> ProfileLogRotation {
+    match env::var(PROFILE_LOG_ROTATION_ENV) {
+        Ok(value) => match value.parse() {
+            Ok(rotation) => rotation,
+            Err(error) => {
+                eprintln!("metrics: {error}; profile log rotation remains disabled");
+                ProfileLogRotation::Never
+            }
+        },
+        Err(env::VarError::NotPresent) => ProfileLogRotation::Never,
+        Err(env::VarError::NotUnicode(_)) => {
+            eprintln!(
+                "metrics: {PROFILE_LOG_ROTATION_ENV} is not valid Unicode; profile log rotation remains disabled"
+            );
+            ProfileLogRotation::Never
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
+struct ProfileLogHour(i64);
+
+fn profile_log_hour(timestamp: DateTime<FixedOffset>) -> ProfileLogHour {
+    ProfileLogHour((timestamp.timestamp() + i64::from(SHANGHAI_OFFSET_SECONDS)).div_euclid(60 * 60))
+}
+
+fn profile_log_archive_suffix(hour: ProfileLogHour) -> io::Result<String> {
+    let local_start = hour
+        .0
+        .checked_mul(60 * 60)
+        .ok_or_else(|| io::Error::other("profile log rotation hour is out of range"))?;
+    let utc_start = local_start
+        .checked_sub(i64::from(SHANGHAI_OFFSET_SECONDS))
+        .ok_or_else(|| io::Error::other("profile log rotation hour is out of range"))?;
+    let timestamp = DateTime::<Utc>::from_timestamp(utc_start, 0)
+        .ok_or_else(|| io::Error::other("profile log rotation hour is out of range"))?
+        .with_timezone(
+            &FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS)
+                .expect("+08:00 must be a valid fixed offset"),
+        );
+    Ok(timestamp.format("%Y%m%d-%H").to_string())
+}
+
+struct ProfileLogFile {
+    path: PathBuf,
+    rotation: ProfileLogRotation,
+    current_hour: Option<ProfileLogHour>,
+}
+
+impl ProfileLogFile {
+    fn new(path: PathBuf, rotation: ProfileLogRotation) -> Self {
+        Self {
+            path,
+            rotation,
+            current_hour: None,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn rotate_if_needed(&mut self, timestamp: DateTime<FixedOffset>) -> io::Result<()> {
+        if self.rotation == ProfileLogRotation::Never {
+            return Ok(());
+        }
+
+        let observed_hour = profile_log_hour(timestamp);
+        match self.current_hour {
+            None => archive_stale_profile_log(&self.path, observed_hour)?,
+            Some(current_hour) if observed_hour > current_hour => {
+                archive_profile_log(&self.path, &profile_log_archive_suffix(current_hour)?)?;
+            }
+            Some(_) => return Ok(()),
+        }
+        self.current_hour = Some(observed_hour);
+        Ok(())
+    }
+}
+
+fn archive_stale_profile_log(path: &Path, current_hour: ProfileLogHour) -> io::Result<()> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.len() == 0 {
+        return Ok(());
+    }
+
+    let offset = FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS)
+        .expect("+08:00 must be a valid fixed offset");
+    let modified = DateTime::<Utc>::from(metadata.modified()?).with_timezone(&offset);
+    let modified_hour = profile_log_hour(modified);
+    if modified_hour < current_hour {
+        archive_profile_log(path, &profile_log_archive_suffix(modified_hour)?)?;
+    }
+    Ok(())
+}
+
+fn archive_profile_log(path: &Path, suffix: &str) -> io::Result<()> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.len() == 0 {
+        return Ok(());
+    }
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("profile log path has no file name"))?
+        .to_string_lossy();
+    let base_name = format!("{file_name}.{suffix}");
+    let mut archive = path.with_file_name(&base_name);
+    let mut collision = 0_u32;
+    while archive.exists() {
+        collision = collision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("too many colliding profile log archives"))?;
+        archive = path.with_file_name(format!("{base_name}.{collision}"));
+    }
+    fs::rename(path, archive)
 }
 
 impl Registry {
@@ -360,4 +523,130 @@ fn append_access_statistic_entry(
         snapshot.failure,
     )
     .expect("writing to a Vec<u8> cannot fail");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn timestamp(hour: u32, minute: u32) -> DateTime<FixedOffset> {
+        FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS)
+            .unwrap()
+            .with_ymd_and_hms(2026, 9, 21, hour, minute, 0)
+            .single()
+            .unwrap()
+    }
+
+    fn temp_profile_log() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!(
+                "metrics-profile-rotation-{}-{nonce}",
+                std::process::id()
+            ))
+            .join("profile.log")
+    }
+
+    #[test]
+    fn parses_profile_log_rotation_case_insensitively() {
+        assert_eq!("never".parse(), Ok(ProfileLogRotation::Never));
+        assert_eq!(" HOURLY ".parse(), Ok(ProfileLogRotation::Hourly));
+        assert!("daily".parse::<ProfileLogRotation>().is_err());
+    }
+
+    #[test]
+    fn archive_suffix_uses_the_fixed_utc_plus_eight_hour() {
+        let utc = Utc
+            .with_ymd_and_hms(2026, 9, 20, 16, 30, 0)
+            .single()
+            .unwrap();
+        let local = utc.with_timezone(&FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS).unwrap());
+
+        assert_eq!(
+            profile_log_archive_suffix(profile_log_hour(local)).unwrap(),
+            "20260921-00"
+        );
+    }
+
+    #[test]
+    fn rotates_only_at_an_hour_boundary_and_keeps_the_active_name() {
+        let path = temp_profile_log();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut log_file = ProfileLogFile::new(path.clone(), ProfileLogRotation::Hourly);
+
+        log_file.rotate_if_needed(timestamp(16, 10)).unwrap();
+        fs::write(&path, b"first hour\n").unwrap();
+        log_file.rotate_if_needed(timestamp(16, 59)).unwrap();
+        assert!(!path.with_file_name("profile.log.20260921-16").exists());
+
+        log_file.rotate_if_needed(timestamp(17, 0)).unwrap();
+        assert_eq!(
+            fs::read(path.with_file_name("profile.log.20260921-16")).unwrap(),
+            b"first hour\n"
+        );
+        assert!(!path.exists());
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn rotation_is_disabled_by_default() {
+        let path = temp_profile_log();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"unrotated\n").unwrap();
+        let mut log_file = ProfileLogFile::new(path.clone(), ProfileLogRotation::default());
+
+        log_file.rotate_if_needed(timestamp(16, 10)).unwrap();
+        log_file.rotate_if_needed(timestamp(17, 0)).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"unrotated\n");
+        assert!(!path.with_file_name("profile.log.20260921-16").exists());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn archives_a_stale_active_file_on_startup() {
+        let path = temp_profile_log();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"stale\n").unwrap();
+        let offset = FixedOffset::east_opt(SHANGHAI_OFFSET_SECONDS).unwrap();
+        let modified = DateTime::<Utc>::from(fs::metadata(&path).unwrap().modified().unwrap())
+            .with_timezone(&offset);
+        let modified_hour = profile_log_hour(modified);
+        let archive = path.with_file_name(format!(
+            "profile.log.{}",
+            profile_log_archive_suffix(modified_hour).unwrap()
+        ));
+
+        archive_stale_profile_log(&path, ProfileLogHour(modified_hour.0 + 1)).unwrap();
+
+        assert_eq!(fs::read(archive).unwrap(), b"stale\n");
+        assert!(!path.exists());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn never_overwrites_an_existing_profile_archive() {
+        let path = temp_profile_log();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let archive = path.with_file_name("profile.log.20260921-16");
+        fs::write(&archive, b"existing archive\n").unwrap();
+        let mut log_file = ProfileLogFile::new(path.clone(), ProfileLogRotation::Hourly);
+
+        log_file.rotate_if_needed(timestamp(16, 10)).unwrap();
+        fs::write(&path, b"new archive\n").unwrap();
+        log_file.rotate_if_needed(timestamp(17, 0)).unwrap();
+
+        assert_eq!(fs::read(&archive).unwrap(), b"existing archive\n");
+        assert_eq!(
+            fs::read(path.with_file_name("profile.log.20260921-16.1")).unwrap(),
+            b"new archive\n"
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
 }
