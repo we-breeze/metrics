@@ -1,6 +1,6 @@
 [package]
 name = "brz-metrics"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
 description = "lightweight high-concurrency metric slot registry"
 license = "Apache-2.0"
