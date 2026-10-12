@@ -4,22 +4,17 @@ use std::time::Duration;
 
 use crate::plan::{MetricPolicy, ProfileFormat};
 
-/// ProfileUtil counters for one metric.
-///
-/// Profile output derives total from its interval buckets. Slow counts need a separate counter:
-/// an operation can cross the slow threshold without crossing an interval boundary (for example,
-/// RPC's 200 ms threshold inside its 100..500 ms bucket).
+/// Counts and microsecond duration sums for all, slow, and failed operations.
+/// Six counters occupy 48 bytes, padded to one 64-byte cache line.
 #[repr(C, align(64))]
 #[derive(Debug, Default)]
 pub(crate) struct Slot {
-    failure: AtomicU64,
-    elapsed_ns: AtomicU64,
-    slow: AtomicU64,
-    interval1: AtomicU64,
-    interval2: AtomicU64,
-    interval3: AtomicU64,
-    interval4: AtomicU64,
-    interval5: AtomicU64,
+    count: AtomicU64,
+    elapsed_us: AtomicU64,
+    slow_count: AtomicU64,
+    slow_elapsed_us: AtomicU64,
+    failure_count: AtomicU64,
+    failure_elapsed_us: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -67,8 +62,7 @@ pub(crate) enum MetricType {
 
 #[derive(Clone, Copy)]
 pub(crate) struct MetricSpec {
-    pub(crate) slow_threshold_ms: u64,
-    pub(crate) intervals_ms: [u64; 4],
+    pub(crate) slow_threshold_us: u64,
 }
 
 impl MetricType {
@@ -112,33 +106,27 @@ impl MetricPolicy {
     #[inline]
     pub(crate) fn spec(self) -> MetricSpec {
         match self {
-            // ProfileUtil resource buckets: <10, <50, <100, <200, >=200 ms.
             Self::Resource => MetricSpec {
-                slow_threshold_ms: 50,
-                intervals_ms: [10, 50, 100, 200],
+                slow_threshold_us: 50_000,
             },
-            // Whole-request and SERVICE metrics retain resource buckets but use 200 ms slow.
-            Self::Service => MetricSpec {
-                slow_threshold_ms: 200,
-                intervals_ms: [10, 50, 100, 200],
-            },
-            // Access-statistic access buckets: <10, <50, <100, <500, >=500 ms.
-            Self::Access => MetricSpec {
-                slow_threshold_ms: 200,
-                intervals_ms: [10, 50, 100, 500],
+            Self::Service | Self::Access => MetricSpec {
+                slow_threshold_us: 200_000,
             },
         }
     }
 }
 
+/// An eventually-consistent view of the current interval's counters.
+/// Duration sums use microseconds. Slow and failed operations may overlap.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MetricSnapshot {
     pub total: u64,
     pub success: u64,
     pub failure: u64,
-    pub elapsed_ns: u64,
+    pub elapsed_us: u64,
     pub slow: u64,
-    pub intervals: [u64; 5],
+    pub slow_elapsed_us: u64,
+    pub failure_elapsed_us: u64,
 }
 
 /// Copyable handle used by the record hot path.
@@ -153,50 +141,36 @@ impl Metric {
         Self { item, policy }
     }
 
-    /// Records a completed operation with nanosecond-precision input.
+    /// Records a completed operation, truncating its duration to whole microseconds.
     ///
-    /// Profile output retains the established millisecond fields and two-decimal average format;
-    /// only that output conversion loses precision. `success == false` increments the
-    /// corresponding failure field in the next log interval.
+    /// Profile output formats durations in milliseconds with two decimal places.
+    /// A slow failed operation contributes to all three count/duration pairs.
     #[inline]
     pub fn record(&self, elapsed: Duration, success: bool) {
         let slot = self.item.as_ref();
         let profile = self.policy.spec();
-        let elapsed_ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        let elapsed_us = elapsed.as_micros().min(u64::MAX as u128) as u64;
 
         if !success {
-            slot.failure.fetch_add(1, Ordering::Relaxed);
+            slot.failure_count.fetch_add(1, Ordering::Relaxed);
+            slot.failure_elapsed_us
+                .fetch_add(elapsed_us, Ordering::Relaxed);
         }
-        slot.elapsed_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-        if elapsed_ns >= profile.slow_threshold_ms.saturating_mul(1_000_000) {
-            slot.slow.fetch_add(1, Ordering::Relaxed);
+        slot.elapsed_us.fetch_add(elapsed_us, Ordering::Relaxed);
+        if elapsed_us >= profile.slow_threshold_us {
+            slot.slow_count.fetch_add(1, Ordering::Relaxed);
+            slot.slow_elapsed_us
+                .fetch_add(elapsed_us, Ordering::Relaxed);
         }
-
-        let interval = match elapsed_ns {
-            elapsed if elapsed < profile.intervals_ms[0].saturating_mul(1_000_000) => {
-                &slot.interval1
-            }
-            elapsed if elapsed < profile.intervals_ms[1].saturating_mul(1_000_000) => {
-                &slot.interval2
-            }
-            elapsed if elapsed < profile.intervals_ms[2].saturating_mul(1_000_000) => {
-                &slot.interval3
-            }
-            elapsed if elapsed < profile.intervals_ms[3].saturating_mul(1_000_000) => {
-                &slot.interval4
-            }
-            _ => &slot.interval5,
-        };
-        interval.fetch_add(1, Ordering::Relaxed);
+        slot.count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records one count-only occurrence without timing or failure data.
     ///
-    /// The occurrence is represented in `total_count` and `interval1`; elapsed,
-    /// failure, and slow counters remain unchanged.
+    /// Only the total count changes; all duration, failure, and slow counters remain unchanged.
     #[inline]
     pub fn increment(&self) {
-        self.item.as_ref().interval1.fetch_add(1, Ordering::Relaxed);
+        self.item.as_ref().count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Returns an eventually-consistent snapshot without blocking `record`.
@@ -209,63 +183,209 @@ impl Metric {
 #[inline]
 pub(crate) fn snapshot(item: ItemPtr) -> MetricSnapshot {
     let slot = item.as_ref();
-    let intervals = [
-        slot.interval1.load(Ordering::Relaxed),
-        slot.interval2.load(Ordering::Relaxed),
-        slot.interval3.load(Ordering::Relaxed),
-        slot.interval4.load(Ordering::Relaxed),
-        slot.interval5.load(Ordering::Relaxed),
-    ];
     MetricSnapshot::from_counters(
-        slot.failure.load(Ordering::Relaxed),
-        slot.elapsed_ns.load(Ordering::Relaxed),
-        slot.slow.load(Ordering::Relaxed),
-        intervals,
+        slot.count.load(Ordering::Relaxed),
+        slot.elapsed_us.load(Ordering::Relaxed),
+        slot.slow_count.load(Ordering::Relaxed),
+        slot.slow_elapsed_us.load(Ordering::Relaxed),
+        slot.failure_count.load(Ordering::Relaxed),
+        slot.failure_elapsed_us.load(Ordering::Relaxed),
     )
 }
 
 #[inline]
 pub(crate) fn drain(item: ItemPtr) -> MetricSnapshot {
     let slot = item.as_ref();
-    let intervals = [
-        slot.interval1.swap(0, Ordering::AcqRel),
-        slot.interval2.swap(0, Ordering::AcqRel),
-        slot.interval3.swap(0, Ordering::AcqRel),
-        slot.interval4.swap(0, Ordering::AcqRel),
-        slot.interval5.swap(0, Ordering::AcqRel),
-    ];
     MetricSnapshot::from_counters(
-        slot.failure.swap(0, Ordering::AcqRel),
-        slot.elapsed_ns.swap(0, Ordering::AcqRel),
-        slot.slow.swap(0, Ordering::AcqRel),
-        intervals,
+        slot.count.swap(0, Ordering::AcqRel),
+        slot.elapsed_us.swap(0, Ordering::AcqRel),
+        slot.slow_count.swap(0, Ordering::AcqRel),
+        slot.slow_elapsed_us.swap(0, Ordering::AcqRel),
+        slot.failure_count.swap(0, Ordering::AcqRel),
+        slot.failure_elapsed_us.swap(0, Ordering::AcqRel),
     )
 }
 
 impl MetricSnapshot {
     #[inline]
-    fn from_counters(failure: u64, elapsed_ns: u64, slow: u64, intervals: [u64; 5]) -> Self {
-        let total = intervals
-            .iter()
-            .fold(0u64, |count, interval| count.wrapping_add(*interval));
+    fn from_counters(
+        total: u64,
+        elapsed_us: u64,
+        slow: u64,
+        slow_elapsed_us: u64,
+        failure: u64,
+        failure_elapsed_us: u64,
+    ) -> Self {
         Self {
             total,
             success: total.saturating_sub(failure),
             failure,
-            elapsed_ns,
+            elapsed_us,
             slow,
-            intervals,
+            slow_elapsed_us,
+            failure_elapsed_us,
         }
     }
 
     pub(crate) fn merge(&mut self, other: Self) {
         self.total = self.total.saturating_add(other.total);
-        self.success = self.success.saturating_add(other.success);
         self.failure = self.failure.saturating_add(other.failure);
-        self.elapsed_ns = self.elapsed_ns.saturating_add(other.elapsed_ns);
+        self.success = self.total.saturating_sub(self.failure);
+        self.elapsed_us = self.elapsed_us.saturating_add(other.elapsed_us);
         self.slow = self.slow.saturating_add(other.slow);
-        for (target, value) in self.intervals.iter_mut().zip(other.intervals) {
-            *target = target.saturating_add(value);
+        self.slow_elapsed_us = self.slow_elapsed_us.saturating_add(other.slow_elapsed_us);
+        self.failure_elapsed_us = self
+            .failure_elapsed_us
+            .saturating_add(other.failure_elapsed_us);
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.total == 0
+            && self.elapsed_us == 0
+            && self.slow == 0
+            && self.slow_elapsed_us == 0
+            && self.failure == 0
+            && self.failure_elapsed_us == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::Registry;
+
+    #[test]
+    fn slot_remains_one_cache_line() {
+        assert_eq!(std::mem::size_of::<Slot>(), 64);
+        assert_eq!(std::mem::align_of::<Slot>(), 64);
+    }
+
+    #[test]
+    fn microsecond_counters_cover_thresholds_and_overlapping_failures() {
+        for (kind, threshold_us) in [
+            (MetricType::Redis, 50_000),
+            (MetricType::Service, 200_000),
+            (MetricType::RpcServiceWhole, 200_000),
+        ] {
+            let registry = Registry::new();
+            let metric = registry.register("threshold", kind);
+            metric.record(Duration::from_nanos(999), true);
+            metric.record(Duration::from_micros(1_234), false);
+            metric.record(Duration::from_nanos(threshold_us * 1_000 - 1), true);
+            metric.record(Duration::from_micros(threshold_us), false);
+            assert_eq!(
+                metric.snapshot(),
+                MetricSnapshot {
+                    total: 4,
+                    success: 2,
+                    failure: 2,
+                    elapsed_us: threshold_us * 2 + 1_233,
+                    slow: 1,
+                    slow_elapsed_us: threshold_us,
+                    failure_elapsed_us: threshold_us + 1_234,
+                },
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_duration_is_clamped_in_microseconds() {
+        let registry = Registry::new();
+        let metric = registry.register("duration-max", MetricType::Redis);
+        metric.record(Duration::MAX, false);
+        let snapshot = metric.snapshot();
+        assert_eq!(snapshot.total, 1);
+        assert_eq!(snapshot.elapsed_us, u64::MAX);
+        assert_eq!(snapshot.slow_elapsed_us, u64::MAX);
+        assert_eq!(snapshot.failure_elapsed_us, u64::MAX);
+    }
+
+    #[test]
+    fn concurrent_record_and_drain_preserve_all_six_counters() {
+        const WORKERS: u64 = 4;
+        const RECORDS: u64 = 10_000;
+        let registry = Registry::new();
+        let metric = registry.register("concurrent", MetricType::Redis);
+        let mut sum = MetricSnapshot::default();
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..WORKERS)
+                .map(|_| {
+                    scope.spawn(move || {
+                        for index in 0..RECORDS {
+                            if index % 2 == 0 {
+                                metric.record(Duration::from_millis(250), false);
+                            } else {
+                                metric.record(Duration::from_millis(5), true);
+                            }
+                        }
+                    })
+                })
+                .collect();
+            let mut collect = || {
+                let sample = drain(metric.item);
+                if !sample.is_empty() {
+                    sum.merge(sample);
+                }
+            };
+            while workers.iter().any(|worker| !worker.is_finished()) {
+                collect();
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            collect();
+        });
+        let total = WORKERS * RECORDS;
+        assert_eq!(sum.total, total);
+        assert_eq!(sum.success, total / 2);
+        assert_eq!(sum.failure, total / 2);
+        assert_eq!(sum.slow, total / 2);
+        assert_eq!(sum.elapsed_us, total / 2 * 255_000);
+        assert_eq!(sum.slow_elapsed_us, total / 2 * 250_000);
+        assert_eq!(sum.failure_elapsed_us, total / 2 * 250_000);
+        assert_eq!(metric.snapshot(), MetricSnapshot::default());
+    }
+
+    #[test]
+    fn duration_only_windows_are_logged_instead_of_discarded() {
+        for kind in [MetricType::Redis, MetricType::RpcServiceWhole] {
+            let registry = Registry::new();
+            let metric = registry.register("partial", kind);
+            // Model a sample boundary that falls between duration and count updates.
+            let slot = metric.item.as_ref();
+            slot.elapsed_us.store(12_346, Ordering::Relaxed);
+            slot.slow_elapsed_us.store(2_000, Ordering::Relaxed);
+            slot.failure_elapsed_us.store(3_000, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "metrics-partial-{}-{:?}.log",
+                std::process::id(),
+                kind,
+            ));
+            let _ = std::fs::remove_file(&path);
+            registry
+                .write_profile_log(
+                    &path,
+                    chrono::Utc::now().fixed_offset(),
+                    &mut Vec::new(),
+                    Duration::from_secs(10),
+                )
+                .unwrap();
+            let content = std::fs::read_to_string(&path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            let rows: Vec<serde_json::Value> = content
+                .lines()
+                .map(|line| serde_json::from_str(&line[20..]).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0]["name"], "partial");
+            assert_eq!(rows[0]["total_time"], "12.35");
+            assert_eq!(rows[0]["slow_time"], "2.00");
+            assert_eq!(rows[0]["error_time"], "3.00");
+            for field in ["avg_time", "slow_avg_time", "error_avg_time", "qps"] {
+                assert_eq!(rows[0][field], "0.00");
+            }
+            assert_eq!(metric.snapshot(), MetricSnapshot::default());
         }
     }
 }

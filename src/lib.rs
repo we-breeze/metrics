@@ -195,9 +195,9 @@ mod tests {
         assert_eq!(registry.len(), 2);
         assert_eq!(snapshots["first"].total, 1);
         assert_eq!(snapshots["first"].success, 1);
-        assert_eq!(snapshots["first"].elapsed_ns, 11_000_000);
+        assert_eq!(snapshots["first"].elapsed_us, 11_000);
         assert_eq!(snapshots["second"].failure, 1);
-        assert_eq!(snapshots["second"].elapsed_ns, 17_000_000);
+        assert_eq!(snapshots["second"].elapsed_us, 17_000);
     }
 
     #[test]
@@ -212,351 +212,243 @@ mod tests {
         assert_eq!(snapshot.total, 2);
         assert_eq!(snapshot.success, 2);
         assert_eq!(snapshot.failure, 0);
-        assert_eq!(snapshot.elapsed_ns, 0);
+        assert_eq!(snapshot.elapsed_us, 0);
         assert_eq!(snapshot.slow, 0);
-        assert_eq!(snapshot.intervals, [2, 0, 0, 0, 0]);
+        assert_eq!(snapshot.slow_elapsed_us, 0);
+        assert_eq!(snapshot.failure_elapsed_us, 0);
         assert_eq!(
             MetricType::Log.output(),
             ("LOG", crate::plan::ProfileFormat::Resource)
         );
     }
 
-    #[test]
-    fn profile_log_matches_profile_util_fields_and_uses_plus_eight_clock() {
-        let registry = Registry::new();
-        let name = "cache.metric";
-        let metric = registry.register(name, MetricType::Redis);
-        metric.record(Duration::from_millis(5), true);
-        metric.record(Duration::from_millis(50), false);
-        metric.record(Duration::from_millis(250), true);
-
+    fn profile_rows(registry: &Registry, interval: Duration) -> Vec<serde_json::Value> {
         let path = std::env::temp_dir().join(format!(
             "metrics-profile-test-{}-{}.log",
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
         ));
         let _ = fs::remove_file(&path);
-        let offset = FixedOffset::east_opt(profile::SHANGHAI_OFFSET_SECONDS).unwrap();
-        let timestamp = offset
+        let timestamp = FixedOffset::east_opt(profile::SHANGHAI_OFFSET_SECONDS)
+            .unwrap()
             .with_ymd_and_hms(2026, 8, 13, 17, 34, 18)
             .single()
             .unwrap();
         let mut buffer = Vec::with_capacity(profile::PROFILE_BUFFER_LIMIT);
         registry
-            .write_profile_log(&path, timestamp, &mut buffer)
-            .unwrap();
-
-        let expected = concat!(
-            "2026-08-13 17:34:18 ",
-            "{\"type\":\"REDIS\",\"name\":\"cache.metric\",\"slowThreshold\":50,",
-            "\"total_count\":3,\"error_count\":1,\"slow_count\":2,\"avg_time\":\"101.67\",",
-            "\"interval1\":1,\"interval2\":0,\"interval3\":1,\"interval4\":0,\"interval5\":1}\n",
-            "2026-08-13 17:34:18 ",
-            "{\"type\":\"OTHER\",\"name\":\"other://profile_baseline\",\"total_count\":10,",
-            "\"error_count\":1,\"slow_count\":1,\"avg_time\":1.0,\"interval1\":6,",
-            "\"interval2\":1,\"interval3\":1,\"interval4\":1,\"interval5\":1}\n",
-        );
-        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
-
-        registry
-            .write_profile_log(&path, timestamp, &mut buffer)
+            .write_profile_log(&path, timestamp, &mut buffer, interval)
             .unwrap();
         let content = fs::read_to_string(&path).unwrap();
-        let lines: Vec<_> = content.lines().collect();
-        assert_eq!(lines.len(), 3);
-        assert!(!content.contains("\"total_count\":0"));
-        assert!(lines[2].contains("\"name\":\"other://profile_baseline\""));
+        let rows = content
+            .lines()
+            .map(|line| {
+                assert!(line.starts_with("2026-08-13 17:34:18 "));
+                let row: serde_json::Value = serde_json::from_str(&line[20..]).unwrap();
+                assert!(
+                    !row.as_object()
+                        .unwrap()
+                        .keys()
+                        .any(|key| key.starts_with("interval"))
+                );
+                row
+            })
+            .collect();
         assert!(buffer.capacity() >= profile::PROFILE_BUFFER_LIMIT);
         fs::remove_file(path).unwrap();
+        rows
+    }
+
+    #[test]
+    fn profile_log_reports_three_groups_using_actual_window_and_milliseconds() {
+        let registry = Registry::new();
+        let metric = registry.register("cache.metric", MetricType::Redis);
+        metric.record(Duration::from_millis(5), true);
+        metric.record(Duration::from_millis(50), false);
+        metric.record(Duration::from_millis(250), true);
+
+        let rows = profile_rows(&registry, Duration::from_millis(2500));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            serde_json::json!({
+                "type": "REDIS", "name": "cache.metric", "slowThreshold": 50.00,
+                "total_count": 3, "error_count": 1, "slow_count": 2,
+                "qps": "1.20", "total_time": "305.00", "avg_time": "101.67",
+                "slow_qps": "0.80", "slow_time": "300.00", "slow_avg_time": "150.00",
+                "error_qps": "0.40", "error_time": "50.00", "error_avg_time": "50.00"
+            })
+        );
+        assert_eq!(rows[1]["name"], "other://profile_baseline");
+        assert_eq!(rows[1]["avg_time"], "1.00");
+        assert_eq!(metric.snapshot(), MetricSnapshot::default());
+
+        let empty = profile_rows(&registry, Duration::from_secs(10));
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0]["name"], "other://profile_baseline");
     }
 
     #[test]
     fn rpc_state_is_persistent_and_uses_the_legacy_profile_shape() {
         let registry = Registry::new();
-        registry.record_state(StateType::Rpc, "group_com.example.Service", "nodes", "4");
-        registry.record_state(
-            StateType::Rpc,
-            "group_com.example.Service",
-            "unavailable",
-            "1",
+        registry.record_state(StateType::Rpc, "group.Service", "nodes", "4");
+        registry.record_state(StateType::Rpc, "group.Service", "unavailable", "1");
+        let first = profile_rows(&registry, Duration::from_secs(10));
+        assert_eq!(
+            first[0],
+            serde_json::json!({
+                "type": "MOTAN_CLUSTER_STAT", "name": "group.Service", "nodes": "4", "unavailable": "1"
+            })
         );
-
-        let path = std::env::temp_dir().join(format!(
-            "metrics-rpc-state-test-{}-{}.log",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let _ = fs::remove_file(&path);
-        let offset = FixedOffset::east_opt(profile::SHANGHAI_OFFSET_SECONDS).unwrap();
-        let timestamp = offset
-            .with_ymd_and_hms(2026, 9, 1, 4, 30, 20)
-            .single()
-            .unwrap();
-        let mut buffer = Vec::with_capacity(profile::PROFILE_BUFFER_LIMIT);
-
-        registry
-            .write_profile_log(&path, timestamp, &mut buffer)
-            .unwrap();
-        let content = fs::read_to_string(&path).unwrap();
-        assert!(content.contains(concat!(
-            "2026-09-01 04:30:20 ",
-            "{\"type\":\"MOTAN_CLUSTER_STAT\",\"name\":\"group_com.example.Service\",",
-            "\"nodes\":\"4\",\"unavailable\":\"1\"}\n",
-        )));
-
-        registry.record_state(
-            StateType::Rpc,
-            "group_com.example.Service",
-            "unavailable",
-            "0",
-        );
-        registry
-            .write_profile_log(&path, timestamp, &mut buffer)
-            .unwrap();
-        let content = fs::read_to_string(&path).unwrap();
-        assert!(content.ends_with(concat!(
-            "2026-09-01 04:30:20 ",
-            "{\"type\":\"OTHER\",\"name\":\"other://profile_baseline\",",
-            "\"total_count\":10,\"error_count\":1,\"slow_count\":1,\"avg_time\":1.0,",
-            "\"interval1\":6,\"interval2\":1,\"interval3\":1,\"interval4\":1,",
-            "\"interval5\":1}\n",
-        )));
-        assert!(content.contains(concat!(
-            "{\"type\":\"MOTAN_CLUSTER_STAT\",\"name\":\"group_com.example.Service\",",
-            "\"nodes\":\"4\",\"unavailable\":\"0\"}\n",
-        )));
-        fs::remove_file(path).unwrap();
+        registry.record_state(StateType::Rpc, "group.Service", "unavailable", "0");
+        let second = profile_rows(&registry, Duration::from_secs(10));
+        assert_eq!(second[0]["nodes"], "4");
+        assert_eq!(second[0]["unavailable"], "0");
+        assert_eq!(second[1]["name"], "other://profile_baseline");
     }
 
     #[test]
     fn service_profile_matches_resource_format() {
         let registry = Registry::new();
-        let metric = registry.register(
-            "org.example.service.ExampleService.operation",
-            MetricType::Service,
-        );
-        metric.record(Duration::from_millis(201), true);
-
-        let path = std::env::temp_dir().join(format!(
-            "metrics-service-profile-test-{}-{}.log",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let _ = fs::remove_file(&path);
-        let offset = FixedOffset::east_opt(profile::SHANGHAI_OFFSET_SECONDS).unwrap();
-        let timestamp = offset
-            .with_ymd_and_hms(2026, 8, 23, 22, 25, 38)
-            .single()
-            .unwrap();
-        let mut buffer = Vec::with_capacity(profile::PROFILE_BUFFER_LIMIT);
         registry
-            .write_profile_log(&path, timestamp, &mut buffer)
-            .unwrap();
-
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            concat!(
-                "2026-08-23 22:25:38 ",
-                "{\"type\":\"SERVICE\",\"name\":\"org.example.service.ExampleService.operation\",",
-                "\"slowThreshold\":200,\"total_count\":1,\"error_count\":0,\"slow_count\":1,\"avg_time\":\"201.00\",",
-                "\"interval1\":0,\"interval2\":0,\"interval3\":0,\"interval4\":0,\"interval5\":1}\n",
-                "2026-08-23 22:25:38 ",
-                "{\"type\":\"OTHER\",\"name\":\"other://profile_baseline\",\"total_count\":10,",
-                "\"error_count\":1,\"slow_count\":1,\"avg_time\":1.0,\"interval1\":6,",
-                "\"interval2\":1,\"interval3\":1,\"interval4\":1,\"interval5\":1}\n",
-            )
-        );
-        fs::remove_file(path).unwrap();
+            .register("example.Service.operation", MetricType::Service)
+            .record(Duration::from_millis(201), true);
+        let rows = profile_rows(&registry, Duration::from_secs(10));
+        assert_eq!(rows[0]["type"], "SERVICE");
+        assert_eq!(rows[0]["slowThreshold"], 200.0);
+        assert_eq!(rows[0]["total_count"], 1);
+        assert_eq!(rows[0]["avg_time"], "201.00");
+        assert_eq!(rows[0]["slow_avg_time"], "201.00");
+        assert_eq!(rows[0]["error_avg_time"], "0.00");
+        assert_eq!(rows[0]["error_qps"], "0.00");
     }
 
     #[test]
     fn memcache_profile_matches_mc_and_mcdetail_formats() {
         let registry = Registry::new();
-        let aggregate = registry.register("15138", MetricType::Mc);
-        let detail = registry.register("15138_down", MetricType::McDetail);
-        aggregate.record(Duration::from_millis(5), true);
-        aggregate.record(Duration::from_millis(60), false);
-        detail.record(Duration::from_millis(5), true);
-        detail.record(Duration::from_millis(60), false);
-
-        let path = std::env::temp_dir().join(format!(
-            "metrics-memcache-profile-test-{}-{}.log",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let _ = fs::remove_file(&path);
-        let offset = FixedOffset::east_opt(profile::SHANGHAI_OFFSET_SECONDS).unwrap();
-        let timestamp = offset
-            .with_ymd_and_hms(2026, 9, 1, 12, 31, 31)
-            .single()
-            .unwrap();
-        let mut buffer = Vec::with_capacity(profile::PROFILE_BUFFER_LIMIT);
-        registry
-            .write_profile_log(&path, timestamp, &mut buffer)
-            .unwrap();
-
-        let content = fs::read_to_string(&path).unwrap();
-        assert_eq!(content.lines().count(), 3);
-        assert!(content.contains(concat!(
-            "{\"type\":\"MC\",\"name\":\"15138\",\"slowThreshold\":50,",
-            "\"total_count\":2,\"error_count\":1,\"slow_count\":1,\"avg_time\":\"32.50\",",
-            "\"interval1\":1,\"interval2\":0,\"interval3\":1,\"interval4\":0,\"interval5\":0}"
-        )));
-        assert!(content.contains(concat!(
-            "{\"type\":\"MCDETAIL\",\"name\":\"15138_down\",\"slowThreshold\":50,",
-            "\"total_count\":2,\"error_count\":1,\"slow_count\":1,\"avg_time\":\"32.50\",",
-            "\"interval1\":1,\"interval2\":0,\"interval3\":1,\"interval4\":0,\"interval5\":0}"
-        )));
-        fs::remove_file(path).unwrap();
+        for kind in [MetricType::Mc, MetricType::McDetail] {
+            let metric = registry.register("15138", kind);
+            metric.record(Duration::from_millis(5), true);
+            metric.record(Duration::from_millis(60), false);
+        }
+        let rows = profile_rows(&registry, Duration::from_secs(10));
+        assert_eq!(rows.len(), 3);
+        for row in &rows[..2] {
+            assert!(row["type"] == "MC" || row["type"] == "MCDETAIL");
+            assert_eq!(row["total_count"], 2);
+            assert_eq!(row["avg_time"], "32.50");
+            assert_eq!(row["slow_count"], 1);
+            assert_eq!(row["slow_avg_time"], "60.00");
+            assert_eq!(row["error_count"], 1);
+            assert_eq!(row["error_avg_time"], "60.00");
+        }
     }
 
     #[test]
     fn http_profile_uses_endpoint_and_whole_request_thresholds() {
         let registry = Registry::new();
-        let endpoint = registry.register("http://service.example.com/api/config", MetricType::Http);
-        let whole = registry.register(
-            "all_http://service.example.com/api/config",
-            MetricType::HttpAll,
-        );
-        endpoint.record(Duration::from_millis(60), true);
-        whole.record(Duration::from_millis(60), true);
-
-        let path = std::env::temp_dir().join(format!(
-            "metrics-http-profile-test-{}-{}.log",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let _ = fs::remove_file(&path);
-        let offset = FixedOffset::east_opt(profile::SHANGHAI_OFFSET_SECONDS).unwrap();
-        let timestamp = offset
-            .with_ymd_and_hms(2026, 9, 1, 12, 31, 31)
-            .single()
-            .unwrap();
-        let mut buffer = Vec::with_capacity(profile::PROFILE_BUFFER_LIMIT);
         registry
-            .write_profile_log(&path, timestamp, &mut buffer)
+            .register("http://service/api", MetricType::Http)
+            .record(Duration::from_millis(60), true);
+        registry
+            .register("all_http://service/api", MetricType::HttpAll)
+            .record(Duration::from_millis(60), true);
+        let rows = profile_rows(&registry, Duration::from_secs(10));
+        let endpoint = rows
+            .iter()
+            .find(|row| row["name"] == "http://service/api")
             .unwrap();
-
-        let content = fs::read_to_string(&path).unwrap();
-        assert!(content.contains(concat!(
-            "{\"type\":\"HTTP\",\"name\":\"http://service.example.com/api/config\",",
-            "\"slowThreshold\":50,\"total_count\":1,\"error_count\":0,",
-            "\"slow_count\":1,\"avg_time\":\"60.00\",\"interval1\":0,",
-            "\"interval2\":0,\"interval3\":1,\"interval4\":0,\"interval5\":0}"
-        )));
-        assert!(content.contains(concat!(
-            "{\"type\":\"HTTP\",\"name\":\"all_http://service.example.com/api/config\",",
-            "\"slowThreshold\":200,\"total_count\":1,\"error_count\":0,",
-            "\"slow_count\":0,\"avg_time\":\"60.00\",\"interval1\":0,",
-            "\"interval2\":0,\"interval3\":1,\"interval4\":0,\"interval5\":0}"
-        )));
-        fs::remove_file(path).unwrap();
+        let whole = rows
+            .iter()
+            .find(|row| row["name"] == "all_http://service/api")
+            .unwrap();
+        assert_eq!(endpoint["slowThreshold"], 50.0);
+        assert_eq!(endpoint["slow_count"], 1);
+        assert_eq!(endpoint["slow_avg_time"], "60.00");
+        assert_eq!(whole["slowThreshold"], 200.0);
+        assert_eq!(whole["slow_count"], 0);
+        assert_eq!(whole["slow_avg_time"], "0.00");
+        assert_eq!(whole["avg_time"], "60.00");
     }
 
     #[test]
     fn rpc_service_whole_profile_uses_access_statistic_shape() {
         let registry = Registry::new();
-        let metric = registry.register(
-            "org.example.EchoService.echo(java.lang.String)",
-            MetricType::RpcServiceWhole,
-        );
+        let metric = registry.register("example.EchoService.echo", MetricType::RpcServiceWhole);
         metric.record(Duration::from_millis(150), true);
         metric.record(Duration::from_millis(250), false);
-
-        let path = std::env::temp_dir().join(format!(
-            "metrics-rpc-profile-test-{}-{}.log",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let _ = fs::remove_file(&path);
-        let offset = FixedOffset::east_opt(profile::SHANGHAI_OFFSET_SECONDS).unwrap();
-        let timestamp = offset
-            .with_ymd_and_hms(2026, 8, 19, 10, 27, 13)
-            .single()
-            .unwrap();
-        let mut buffer = Vec::with_capacity(profile::PROFILE_BUFFER_LIMIT);
-        registry
-            .write_profile_log(&path, timestamp, &mut buffer)
-            .unwrap();
-
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            concat!(
-                "2026-08-19 10:27:13 ",
-                "{\"type\":\"RPC_SERVICE_WHOLE\",\"name\":\"org.example.EchoService.echo(java.lang.String)\",",
-                "\"slowThreshold\":\"200\",\"total_count\":\"2\",\"slow_count\":\"1\",\"avg_time\":\"200.00\",",
-                "\"interval1\":\"0\",\"interval2\":\"0\",\"interval3\":\"0\",\"interval4\":\"2\",\"interval5\":\"0\",",
-                "\"p75\":\"0.00\",\"p95\":\"0.00\",\"p98\":\"0.00\",\"p99\":\"0.00\",\"p999\":\"0.00\",",
-                "\"biz_excp\":\"0\",\"other_excp\":\"1\",\"avg_tps\":\"0\",\"max_tps\":\"0\",\"min_tps\":\"0\"}\n",
-                "2026-08-19 10:27:13 ",
-                "{\"type\":\"OTHER\",\"name\":\"other://profile_baseline\",\"total_count\":10,",
-                "\"error_count\":1,\"slow_count\":1,\"avg_time\":1.0,\"interval1\":6,",
-                "\"interval2\":1,\"interval3\":1,\"interval4\":1,\"interval5\":1}\n",
-            )
-        );
-        fs::remove_file(path).unwrap();
+        let rows = profile_rows(&registry, Duration::from_secs(4));
+        let row = &rows[0];
+        assert_eq!(row["type"], "RPC_SERVICE_WHOLE");
+        assert_eq!(row["slowThreshold"], "200.00");
+        assert_eq!(row["total_count"], "2");
+        assert_eq!(row["error_count"], "1");
+        assert_eq!(row["slow_count"], "1");
+        assert_eq!(row["qps"], "0.50");
+        assert_eq!(row["avg_tps"], "0.50");
+        assert_eq!(row["avg_time"], "200.00");
+        assert_eq!(row["slow_qps"], "0.25");
+        assert_eq!(row["slow_avg_time"], "250.00");
+        assert_eq!(row["error_qps"], "0.25");
+        assert_eq!(row["error_avg_time"], "250.00");
+        assert_eq!(row["other_excp"], "1");
     }
 
     #[test]
     fn one_slot_fans_out_and_flush_time_aggregate_merges_methods() {
         use crate::plan::{MetricPolicy, ProfileFormat, ProfilePlan};
-
         let registry = Registry::new();
         let first = registry.register_profile(
             ProfilePlan::new(
-                "client|app|module|Service.first(void)",
+                "first",
                 MetricPolicy::Access,
                 ProfileFormat::AccessStatistic,
                 "RPC_SERVICE_CLIENT",
-                "example.Service.first(void)",
+                "example.Service.first",
             )
-            .alias("SERVICE", "example.Service.first(void)")
-            .alias("RPC_SERVICE_CLIENT_V2", "module_Service.first(void)")
+            .alias("SERVICE", "example.Service.first")
+            .alias("RPC_SERVICE_CLIENT_V2", "module_Service.first")
             .aggregate("SERVICE", "app_module"),
         );
         let second = registry.register_profile(
             ProfilePlan::new(
-                "client|app|module|Service.second(void)",
+                "second",
                 MetricPolicy::Access,
                 ProfileFormat::AccessStatistic,
                 "RPC_SERVICE_CLIENT",
-                "example.Service.second(void)",
+                "example.Service.second",
             )
-            .alias("SERVICE", "example.Service.second(void)")
-            .alias("RPC_SERVICE_CLIENT_V2", "module_Service.second(void)")
+            .alias("SERVICE", "example.Service.second")
+            .alias("RPC_SERVICE_CLIENT_V2", "module_Service.second")
             .aggregate("SERVICE", "app_module"),
         );
-        first.record(Duration::from_millis(10), true);
-        second.record(Duration::from_millis(30), true);
-
-        let path = std::env::temp_dir().join(format!(
-            "metrics-profile-fanout-test-{}-{}.log",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let _ = fs::remove_file(&path);
-        let offset = FixedOffset::east_opt(profile::SHANGHAI_OFFSET_SECONDS).unwrap();
-        let timestamp = offset
-            .with_ymd_and_hms(2026, 9, 1, 13, 0, 0)
-            .single()
-            .unwrap();
-        let mut buffer = Vec::with_capacity(profile::PROFILE_BUFFER_LIMIT);
-        registry
-            .write_profile_log(&path, timestamp, &mut buffer)
-            .unwrap();
-
-        let content = fs::read_to_string(&path).unwrap();
-        assert_eq!(content.lines().count(), 8);
-        assert!(content.contains(
-            "\"type\":\"RPC_SERVICE_CLIENT_V2\",\"name\":\"module_Service.first(void)\""
-        ));
-        assert!(content.contains("\"type\":\"SERVICE\",\"name\":\"example.Service.second(void)\""));
-        assert!(content.contains(concat!(
-            "{\"type\":\"SERVICE\",\"name\":\"app_module\",\"slowThreshold\":\"200\",",
-            "\"total_count\":\"2\",\"slow_count\":\"0\",\"avg_time\":\"20.00\",",
-            "\"interval1\":\"0\",\"interval2\":\"2\""
-        )));
-        fs::remove_file(path).unwrap();
+        first.record(Duration::from_millis(250), false);
+        first.record(Duration::from_millis(150), true);
+        second.record(Duration::from_millis(450), true);
+        let rows = profile_rows(&registry, Duration::from_secs(2));
+        assert_eq!(rows.len(), 8);
+        let aliases: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                row["name"] == "example.Service.first" || row["name"] == "module_Service.first"
+            })
+            .collect();
+        assert_eq!(aliases.len(), 3);
+        for alias in aliases {
+            assert_eq!(alias["total_count"], "2");
+            assert_eq!(alias["avg_time"], "200.00");
+            assert_eq!(alias["error_avg_time"], "250.00");
+        }
+        let aggregate = rows.iter().find(|row| row["name"] == "app_module").unwrap();
+        assert_eq!(aggregate["total_count"], "3");
+        assert_eq!(aggregate["total_time"], "850.00");
+        assert_eq!(aggregate["qps"], "1.50");
+        assert_eq!(aggregate["avg_time"], "283.33");
+        assert_eq!(aggregate["slow_count"], "2");
+        assert_eq!(aggregate["slow_time"], "700.00");
+        assert_eq!(aggregate["slow_qps"], "1.00");
+        assert_eq!(aggregate["slow_avg_time"], "350.00");
+        assert_eq!(aggregate["error_count"], "1");
+        assert_eq!(aggregate["error_avg_time"], "250.00");
     }
 
     #[test]
@@ -599,7 +491,7 @@ mod tests {
             .single()
             .unwrap();
         registry
-            .write_profile_log(&path, timestamp, &mut Vec::new())
+            .write_profile_log(&path, timestamp, &mut Vec::new(), Duration::from_secs(10))
             .unwrap();
         let content = fs::read_to_string(&path).unwrap();
         let rows: Vec<serde_json::Value> = content

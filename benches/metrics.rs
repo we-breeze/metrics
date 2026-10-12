@@ -56,40 +56,29 @@ fn record_latency(c: &mut Criterion) {
             let idx = (seq % metrics.len() as u64) as usize;
             seq = seq.wrapping_add(1);
             let m = metrics[idx];
-            let elapsed_ns = 1_000_000 + (idx as u64 % 9_000_000);
-            m.record(Duration::from_nanos(elapsed_ns), (idx & 1) == 0);
+            let elapsed = Duration::from_nanos(1_000_000 + (idx as u64 % 9_000_000));
+            m.record(elapsed, (idx & 1) == 0);
             black_box(idx);
         });
     });
 }
 
 fn visit_cost(c: &mut Criterion) {
-    let mut sum = MetricSnapshot {
-        total: 0,
-        success: 0,
-        failure: 0,
-        elapsed_ns: 0,
-        slow: 0,
-        intervals: [0; 5],
-    };
+    let mut sum = MetricSnapshot::default();
 
     c.bench_function("visit", |b| {
         b.iter(|| {
-            sum = MetricSnapshot {
-                total: 0,
-                success: 0,
-                failure: 0,
-                elapsed_ns: 0,
-                slow: 0,
-                intervals: [0; 5],
-            };
+            sum = MetricSnapshot::default();
             visit(|_name, _kind, s| {
                 sum.total = sum.total.wrapping_add(s.total);
                 sum.success = sum.success.wrapping_add(s.success);
                 sum.failure = sum.failure.wrapping_add(s.failure);
-                sum.elapsed_ns = sum.elapsed_ns.wrapping_add(s.elapsed_ns);
+                sum.elapsed_us = sum.elapsed_us.wrapping_add(s.elapsed_us);
+                sum.slow = sum.slow.wrapping_add(s.slow);
+                sum.slow_elapsed_us = sum.slow_elapsed_us.wrapping_add(s.slow_elapsed_us);
+                sum.failure_elapsed_us = sum.failure_elapsed_us.wrapping_add(s.failure_elapsed_us);
             });
-            black_box(sum.total + sum.success + sum.failure + sum.elapsed_ns);
+            black_box(sum);
         });
     });
 }
@@ -107,8 +96,8 @@ fn main_probe() {
     a.record(Duration::from_millis(1), true);
     visit(|name, kind, s| {
         println!(
-            "{name} {kind} total={} success={} fail={} elapsed_ns={}",
-            s.total, s.success, s.failure, s.elapsed_ns
+            "{name} {kind} total={} success={} fail={} elapsed_us={}",
+            s.total, s.success, s.failure, s.elapsed_us
         );
     });
     println!("probe done in {:?}", start.elapsed());

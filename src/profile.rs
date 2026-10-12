@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PROFILE_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_PROFILE_LOG_PATH: &str = "../logs/profile.log";
@@ -26,6 +26,7 @@ pub(crate) fn start_default_profile_logger(registry: &'static Registry) {
     PROFILE_LOGGER_STARTED.get_or_init(|| {
         let path = profile_log_path();
         let rotation = profile_log_rotation();
+        let mut last_sample = Instant::now();
         if let Err(error) = thread::Builder::new()
             .name("metrics-profile-log".to_owned())
             .spawn(move || {
@@ -43,8 +44,23 @@ pub(crate) fn start_default_profile_logger(registry: &'static Registry) {
                         );
                         continue;
                     }
+                    // Open before advancing the window: if opening fails, counters have not been
+                    // drained and the next QPS calculation must include the missed interval.
+                    let file = match open_profile_log(log_file.path()) {
+                        Ok(file) => file,
+                        Err(error) => {
+                            eprintln!(
+                                "metrics: failed to open {}: {error}",
+                                log_file.path().display()
+                            );
+                            continue;
+                        }
+                    };
+                    let sampled_at = Instant::now();
+                    let interval = sampled_at.duration_since(last_sample);
+                    last_sample = sampled_at;
                     if let Err(error) =
-                        registry.write_profile_log(log_file.path(), timestamp, &mut buffer)
+                        registry.write_profile_log_to(file, timestamp, &mut buffer, interval)
                     {
                         eprintln!(
                             "metrics: failed to write {}: {error}",
@@ -213,21 +229,41 @@ fn archive_profile_log(path: &Path, suffix: &str) -> io::Result<()> {
     fs::rename(path, archive)
 }
 
+fn open_profile_log(path: &Path) -> io::Result<File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Reopen for each interval so an external log rotator can rename the old file safely.
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
 impl Registry {
+    #[cfg(test)]
     pub(crate) fn write_profile_log(
         &self,
         path: &Path,
         timestamp: DateTime<FixedOffset>,
         buffer: &mut Vec<u8>,
+        interval: Duration,
     ) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        self.write_profile_log_to(open_profile_log(path)?, timestamp, buffer, interval)
+    }
 
-        // Reopen for each interval so an external log rotator can rename the old file safely.
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+    fn write_profile_log_to(
+        &self,
+        file: File,
+        timestamp: DateTime<FixedOffset>,
+        buffer: &mut Vec<u8>,
+        interval: Duration,
+    ) -> io::Result<()> {
+        if interval.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "profile sample interval must be positive",
+            ));
+        }
         let timestamp = timestamp.format("%Y-%m-%d %H:%M:%S").to_string();
-        let mut writer = ProfileLogWriter::new(file, buffer, timestamp);
+        let mut writer = ProfileLogWriter::new(file, buffer, timestamp, interval);
         self.for_each_meta(|meta| writer.write_entry(meta));
         writer.write_aggregate_entries();
         for state in self.state_snapshot() {
@@ -235,7 +271,7 @@ impl Registry {
         }
         // Java's ProfileUtil.logBaselineAccessStaticstic() appends a fixed
         // sentinel entry after every interval so monitors can confirm the
-        // profiler is alive. The values are constant by design.
+        // profiler is alive. Counts and duration sums are constant by design.
         writer.write_baseline_entry();
         writer.finish()
     }
@@ -246,6 +282,7 @@ struct ProfileLogWriter<'a> {
     file: File,
     buffer: &'a mut Vec<u8>,
     timestamp: String,
+    interval: Duration,
     error: Option<io::Error>,
     aggregates: HashMap<AggregateKey, MetricSnapshot>,
 }
@@ -258,12 +295,13 @@ struct AggregateKey {
 }
 
 impl<'a> ProfileLogWriter<'a> {
-    fn new(file: File, buffer: &'a mut Vec<u8>, timestamp: String) -> Self {
+    fn new(file: File, buffer: &'a mut Vec<u8>, timestamp: String, interval: Duration) -> Self {
         buffer.clear();
         Self {
             file,
             buffer,
             timestamp,
+            interval,
             error: None,
             aggregates: HashMap::new(),
         }
@@ -274,10 +312,10 @@ impl<'a> ProfileLogWriter<'a> {
             return;
         }
 
-        // `swap(0)` keeps the interval accounting lossless. Empty interval rows
-        // add no profile value, so omit them from the log.
+        // Fields are drained independently and may straddle a concurrent record. Keep rows with
+        // any nonzero counter, including duration-only rows, so no drained values are discarded.
         let snapshot = drain(meta.item);
-        if snapshot.total == 0 {
+        if snapshot.is_empty() {
             return;
         }
         match &meta.profile {
@@ -356,15 +394,29 @@ impl<'a> ProfileLogWriter<'a> {
         format: ProfileFormat,
         snapshot: MetricSnapshot,
     ) {
-        append_profile_entry(
-            self.buffer,
-            &self.timestamp,
-            metric_type,
-            name,
-            policy.spec(),
-            format,
-            snapshot,
-        );
+        if self.error.is_some() {
+            return;
+        }
+        match format {
+            ProfileFormat::Resource => append_resource_entry(
+                self.buffer,
+                &self.timestamp,
+                metric_type,
+                name,
+                policy.spec(),
+                snapshot,
+                self.interval,
+            ),
+            ProfileFormat::AccessStatistic => append_access_statistic_entry(
+                self.buffer,
+                &self.timestamp,
+                metric_type,
+                name,
+                policy.spec(),
+                snapshot,
+                self.interval,
+            ),
+        }
         if self.buffer.len() >= PROFILE_BUFFER_LIMIT {
             self.flush_buffer();
         }
@@ -376,14 +428,27 @@ impl<'a> ProfileLogWriter<'a> {
         if self.error.is_some() {
             return;
         }
-        // type=OTHER, total=10, error=1, slow=1, avg=1.00,
-        // interval1=6, interval2=1, interval3=1, interval4=1, interval5=1
-        writeln!(
+        append_entry_header(
             self.buffer,
-            "{} {{\"type\":\"OTHER\",\"name\":\"other://profile_baseline\",\"total_count\":10,\"error_count\":1,\"slow_count\":1,\"avg_time\":1.0,\"interval1\":6,\"interval2\":1,\"interval3\":1,\"interval4\":1,\"interval5\":1}}",
-            self.timestamp,
-        )
-        .expect("writing to a Vec<u8> cannot fail");
+            &self.timestamp,
+            "OTHER",
+            "other://profile_baseline",
+        );
+        append_snapshot_fields(
+            self.buffer,
+            MetricSnapshot {
+                total: 10,
+                success: 9,
+                failure: 1,
+                elapsed_us: 10_000,
+                slow: 1,
+                slow_elapsed_us: 1_000,
+                failure_elapsed_us: 1_000,
+            },
+            ProfileFormat::Resource,
+            self.interval,
+        );
+        writeln!(self.buffer, "}}").expect("writing to a Vec<u8> cannot fail");
         if self.buffer.len() >= PROFILE_BUFFER_LIMIT {
             self.flush_buffer();
         }
@@ -424,25 +489,6 @@ fn append_entry_header(buffer: &mut Vec<u8>, timestamp: &str, metric_type: &str,
     append_json_string(buffer, name);
 }
 
-fn append_profile_entry(
-    buffer: &mut Vec<u8>,
-    timestamp: &str,
-    metric_type: &str,
-    name: &str,
-    profile: MetricSpec,
-    format: ProfileFormat,
-    snapshot: MetricSnapshot,
-) {
-    match format {
-        ProfileFormat::Resource => {
-            append_resource_entry(buffer, timestamp, metric_type, name, profile, snapshot)
-        }
-        ProfileFormat::AccessStatistic => {
-            append_access_statistic_entry(buffer, timestamp, metric_type, name, profile, snapshot);
-        }
-    }
-}
-
 fn append_resource_entry(
     buffer: &mut Vec<u8>,
     timestamp: &str,
@@ -450,38 +496,73 @@ fn append_resource_entry(
     name: &str,
     profile: MetricSpec,
     snapshot: MetricSnapshot,
+    interval: Duration,
 ) {
     append_entry_header(buffer, timestamp, metric_type, name);
     write!(
         buffer,
-        ",\"slowThreshold\":{},\"total_count\":{},\"error_count\":{},\"slow_count\":{},\"avg_time\":",
-        profile.slow_threshold_ms,
-        snapshot.total,
-        snapshot.failure,
-        snapshot.slow,
+        ",\"slowThreshold\":{:.2}",
+        profile.slow_threshold_us as f64 / 1_000.0,
     )
     .expect("writing to a Vec<u8> cannot fail");
-    append_resource_average(buffer, snapshot);
-    writeln!(
-        buffer,
-        ",\"interval1\":{},\"interval2\":{},\"interval3\":{},\"interval4\":{},\"interval5\":{}}}",
-        snapshot.intervals[0],
-        snapshot.intervals[1],
-        snapshot.intervals[2],
-        snapshot.intervals[3],
-        snapshot.intervals[4],
-    )
-    .expect("writing to a Vec<u8> cannot fail");
+    append_snapshot_fields(buffer, snapshot, ProfileFormat::Resource, interval);
+    writeln!(buffer, "}}").expect("writing to a Vec<u8> cannot fail");
 }
 
-fn append_resource_average(buffer: &mut Vec<u8>, snapshot: MetricSnapshot) {
-    if snapshot.total == 0 {
-        buffer.extend_from_slice(b"0.0");
-    } else {
+fn qps(count: u64, interval: Duration) -> f64 {
+    count as f64 / interval.as_secs_f64()
+}
+
+fn append_snapshot_fields(
+    buffer: &mut Vec<u8>,
+    snapshot: MetricSnapshot,
+    format: ProfileFormat,
+    interval: Duration,
+) {
+    for (key, value) in [
+        ("total_count", snapshot.total),
+        ("error_count", snapshot.failure),
+        ("slow_count", snapshot.slow),
+    ] {
+        match format {
+            ProfileFormat::Resource => write!(buffer, ",\"{key}\":{value}"),
+            ProfileFormat::AccessStatistic => write!(buffer, ",\"{key}\":\"{value}\""),
+        }
+        .expect("writing to a Vec<u8> cannot fail");
+    }
+    for (rate_key, time_key, avg_key, count, elapsed_us) in [
+        (
+            "qps",
+            "total_time",
+            "avg_time",
+            snapshot.total,
+            snapshot.elapsed_us,
+        ),
+        (
+            "slow_qps",
+            "slow_time",
+            "slow_avg_time",
+            snapshot.slow,
+            snapshot.slow_elapsed_us,
+        ),
+        (
+            "error_qps",
+            "error_time",
+            "error_avg_time",
+            snapshot.failure,
+            snapshot.failure_elapsed_us,
+        ),
+    ] {
+        let total_ms = elapsed_us as f64 / 1_000.0;
+        let avg_ms = if count == 0 {
+            0.0
+        } else {
+            total_ms / count as f64
+        };
         write!(
             buffer,
-            "\"{:.2}\"",
-            snapshot.elapsed_ns as f64 / snapshot.total as f64 / 1_000_000.0
+            ",\"{rate_key}\":\"{:.2}\",\"{time_key}\":\"{total_ms:.2}\",\"{avg_key}\":\"{avg_ms:.2}\"",
+            qps(count, interval),
         )
         .expect("writing to a Vec<u8> cannot fail");
     }
@@ -494,33 +575,21 @@ fn append_access_statistic_entry(
     name: &str,
     profile: MetricSpec,
     snapshot: MetricSnapshot,
+    interval: Duration,
 ) {
     append_entry_header(buffer, timestamp, metric_type, name);
     write!(
         buffer,
-        ",\"slowThreshold\":\"{}\",\"total_count\":\"{}\",\"slow_count\":\"{}\",\"avg_time\":",
-        profile.slow_threshold_ms, snapshot.total, snapshot.slow,
+        ",\"slowThreshold\":\"{:.2}\"",
+        profile.slow_threshold_us as f64 / 1_000.0,
     )
     .expect("writing to a Vec<u8> cannot fail");
-    if snapshot.total == 0 {
-        buffer.extend_from_slice(b"\"0\"");
-    } else {
-        write!(
-            buffer,
-            "\"{:.2}\"",
-            snapshot.elapsed_ns as f64 / snapshot.total as f64 / 1_000_000.0
-        )
-        .expect("writing to a Vec<u8> cannot fail");
-    }
+    append_snapshot_fields(buffer, snapshot, ProfileFormat::AccessStatistic, interval);
     writeln!(
         buffer,
-        ",\"interval1\":\"{}\",\"interval2\":\"{}\",\"interval3\":\"{}\",\"interval4\":\"{}\",\"interval5\":\"{}\",\"p75\":\"0.00\",\"p95\":\"0.00\",\"p98\":\"0.00\",\"p99\":\"0.00\",\"p999\":\"0.00\",\"biz_excp\":\"0\",\"other_excp\":\"{}\",\"avg_tps\":\"0\",\"max_tps\":\"0\",\"min_tps\":\"0\"}}",
-        snapshot.intervals[0],
-        snapshot.intervals[1],
-        snapshot.intervals[2],
-        snapshot.intervals[3],
-        snapshot.intervals[4],
+        ",\"p75\":\"0.00\",\"p95\":\"0.00\",\"p98\":\"0.00\",\"p99\":\"0.00\",\"p999\":\"0.00\",\"biz_excp\":\"0\",\"other_excp\":\"{}\",\"avg_tps\":\"{:.2}\",\"max_tps\":\"0\",\"min_tps\":\"0\"}}",
         snapshot.failure,
+        qps(snapshot.total, interval),
     )
     .expect("writing to a Vec<u8> cannot fail");
 }
@@ -550,6 +619,21 @@ mod tests {
                 std::process::id()
             ))
             .join("profile.log")
+    }
+
+    #[test]
+    fn zero_sample_interval_is_rejected_without_draining() {
+        let registry = Registry::new();
+        let metric = registry.register("zero-window", crate::metric::MetricType::Redis);
+        metric.record(Duration::from_micros(1_234), true);
+        let path = temp_profile_log();
+        let error = registry
+            .write_profile_log(&path, timestamp(16, 10), &mut Vec::new(), Duration::ZERO)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(metric.snapshot().total, 1);
+        assert_eq!(metric.snapshot().elapsed_us, 1_234);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
