@@ -3,7 +3,7 @@
 Minimal in-crate metric registry focused on:
 
 - sharded, synchronous registration during service startup
-- fixed `Slot` layout with six `AtomicU64` counters
+- fixed 64-byte-aligned `Slot` layout with six `AtomicU64` counters
 - lock-free record path
 - allocation-free periodic visit at every lifecycle stage, using `ArcSwap`
 - keyed AHash routing and lookup for long metric names
@@ -24,7 +24,7 @@ counters and appends ProfileUtil-compatible lines to `../logs/profile.log`; time
 use the `+08:00` clock but intentionally have no timezone suffix. Set
 `BREEZE_PROFILE_LOG_PATH` before the first registration to override the path.
 The default path is relative to the process working directory.
-Metric rows whose current interval has `total_count == 0` are not written.
+Metric rows whose current interval has all six counters equal to zero are not written.
 State rows and the fixed baseline liveness row are still written every interval.
 
 Profile log rotation is disabled by default. Set `BREEZE_PROFILE_LOG_ROTATION=hourly`
@@ -34,8 +34,39 @@ the configured name, while completed UTC+8 hours are archived with names such as
 does not delete or compress archives. If an archive name already exists, a numeric
 suffix such as `.1` is appended instead of overwriting it.
 
-`Slot` stores error, elapsed-nanosecond sum, and five latency buckets. `total` and `slow` are
-derived from the buckets; `success` is derived as `total - error` in snapshots.
+`Slot` stores three count/duration-sum pairs: all requests, slow requests, and failed
+requests. Durations are truncated to whole microseconds when recorded. A slow failed
+request contributes to all three pairs. Six counters occupy 48 bytes; with alignment,
+each slot occupies 64 bytes. No latency buckets or `interval1`–`interval5` fields are
+maintained or logged. `success` is derived as `total - failure`, saturating at zero.
+
+`MetricSnapshot` exposes `total`, `success`, `failure`, `elapsed_us`, `slow`,
+`slow_elapsed_us`, and `failure_elapsed_us`. This replaces the old `elapsed_ns` and
+`intervals` fields; callers using those fields must migrate when upgrading.
+
+Profile rows retain `total_count`, `slow_count`, and `error_count` and add:
+
+| Requests | QPS | Duration sum (ms) | Average duration (ms) |
+| --- | --- | --- | --- |
+| All | `qps` | `total_time` | `avg_time` |
+| Slow | `slow_qps` | `slow_time` | `slow_avg_time` |
+| Failed | `error_qps` | `error_time` | `error_avg_time` |
+
+QPS uses the actual elapsed sampling window measured by a monotonic clock, including
+logging delays and intervals skipped because the log file could not be opened or
+rotated. Rates and durations are JSON strings with exactly two decimal places;
+duration sums and averages are in **milliseconds**. An average with a zero count is
+`"0.00"`. `slowThreshold` is also in milliseconds, with two decimal places. Resource
+counts remain JSON numbers; access-statistic counts remain strings. Access-statistic
+`avg_tps` now reports the same measured rate as `qps`; percentile, min/max TPS, and
+business-exception fields remain compatibility placeholders.
+
+Counters are read and drained independently, so snapshots and log windows are
+eventually consistent rather than atomic across all six fields. A record racing a
+sample can put its count and duration in neighboring windows. Rows containing only
+duration data are retained with zero QPS/average and nonzero duration sums, so those
+drained values are not silently discarded. Log writes remain best effort: an I/O
+failure after counters have been drained can lose that batch.
 
 HTTP server route metrics use profile types `API`, `API3XX`, `API4XX`,
 `API5XX`, and `APITO`, all with the unmodified route template as `name` and the

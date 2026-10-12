@@ -2,15 +2,15 @@ use std::sync::Arc;
 
 /// Counter policy applied by [`crate::Metric::record`].
 ///
-/// This describes only threshold and bucket behavior. Protocol-specific
+/// This describes only slow-threshold behavior. Protocol-specific
 /// output names remain in [`ProfilePlan`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MetricPolicy {
-    /// Standard resource buckets with a 50 ms slow threshold.
+    /// Resource metrics with a 50 ms slow threshold.
     Resource,
-    /// Standard resource buckets with a 200 ms slow threshold.
+    /// Service metrics with a 200 ms slow threshold.
     Service,
-    /// Access-statistic buckets with a 200 ms slow threshold.
+    /// Access-statistic metrics with a 200 ms slow threshold.
     Access,
 }
 
