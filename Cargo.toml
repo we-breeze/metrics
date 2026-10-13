@@ -1,6 +1,6 @@
 [package]
 name = "brz-metrics"
-version = "0.0.8"
+version = "0.0.9"
 edition = "2024"
 description = "lightweight high-concurrency metric slot registry"
 license = "Apache-2.0"
@@ -14,11 +14,14 @@ build = "build.rs"
 [lib]
 name = "brz_metrics"
 
+[features]
+default = []
+tokio = ["dep:tokio"]
+
 [dependencies]
 ahash = "0.8"
 arc-swap = "1.9.2"
-chrono = "0.4"
-serde_json = "1"
+tokio = { version = "1", optional = true, default-features = false, features = ["io-util"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

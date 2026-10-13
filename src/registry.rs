@@ -25,8 +25,8 @@ pub(crate) struct MetricMeta {
 ///
 /// Entries are written once, in increasing order. `published_len` is the release/acquire boundary
 /// that prevents visitors from touching a not-yet-initialized entry.
-pub(crate) struct MetaChunk {
-    entries: [UnsafeCell<MaybeUninit<MetricMeta>>; CHUNK_SIZE],
+pub(crate) struct MetaChunk<T = MetricMeta> {
+    entries: [UnsafeCell<MaybeUninit<T>>; CHUNK_SIZE],
     published_len: AtomicUsize,
 }
 
@@ -35,17 +35,17 @@ pub(crate) struct MetaChunk {
 // Each entry has its own UnsafeCell, so references to published entries never cover
 // a different entry being initialized concurrently. Once initialized, an entry is immutable. The sole writer for a chunk is serialized by its shard
 // mutex, so no two writers access the same entry.
-unsafe impl Sync for MetaChunk {}
+unsafe impl<T: Send + Sync> Sync for MetaChunk<T> {}
 
-impl MetaChunk {
-    fn new() -> Self {
+impl<T> MetaChunk<T> {
+    pub(crate) fn new() -> Self {
         Self {
             entries: std::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit())),
             published_len: AtomicUsize::new(0),
         }
     }
 
-    fn publish(&self, offset: usize, meta: MetricMeta) {
+    pub(crate) fn publish(&self, offset: usize, meta: T) {
         debug_assert!(offset < CHUNK_SIZE);
         debug_assert_eq!(self.published_len.load(Ordering::Relaxed), offset);
 
@@ -58,12 +58,12 @@ impl MetaChunk {
     }
 
     #[inline]
-    fn published_len(&self) -> usize {
+    pub(crate) fn published_len(&self) -> usize {
         self.published_len.load(Ordering::Acquire)
     }
 
     #[inline]
-    fn get(&self, offset: usize) -> &MetricMeta {
+    pub(crate) fn get(&self, offset: usize) -> &T {
         debug_assert!(offset < self.published_len());
         // Safety: `visit` accesses only offsets below an Acquire-loaded published prefix. Such an
         // entry was fully initialized before the corresponding Release store and is immutable.
@@ -71,7 +71,7 @@ impl MetaChunk {
     }
 }
 
-impl Drop for MetaChunk {
+impl<T> Drop for MetaChunk<T> {
     fn drop(&mut self) {
         let published = self.published_len.load(Ordering::Relaxed);
         for offset in 0..published {
@@ -83,12 +83,12 @@ impl Drop for MetaChunk {
 
 /// Immutable index published for one shard. The index owns only chunk pointers, not metadata.
 #[derive(Clone)]
-pub(crate) struct ShardIndex {
-    pub(crate) chunks: Arc<[Arc<MetaChunk>]>,
+pub(crate) struct ShardIndex<T = MetricMeta> {
+    pub(crate) chunks: Arc<[Arc<MetaChunk<T>>]>,
 }
 
-impl ShardIndex {
-    fn empty() -> Self {
+impl<T> ShardIndex<T> {
+    pub(crate) fn empty() -> Self {
         Self {
             chunks: Arc::from([]),
         }
@@ -162,7 +162,7 @@ impl ShardState {
             published_index.store(Arc::new(index));
         }
 
-        (Metric::new(item, policy), item)
+        (Metric::from_item(item, policy), item)
     }
 
     fn insert(
@@ -214,7 +214,7 @@ impl Shard {
     pub(crate) fn register(&self, name: &str, kind: MetricType) -> Metric {
         let mut state = self.state.lock().expect("metrics shard mutex poisoned");
         if let Some(item) = state.existing(name, kind) {
-            return Metric::new(item, kind.policy());
+            return Metric::from_item(item, kind.policy());
         }
         state.insert(&self.published_index, Arc::from(name), kind)
     }
@@ -222,13 +222,14 @@ impl Shard {
     pub(crate) fn register_profile(&self, plan: ProfilePlan) -> Metric {
         let mut state = self.state.lock().expect("metrics shard mutex poisoned");
         if let Some(item) = state.existing_profile(&plan.identity, plan.policy) {
-            return Metric::new(item, plan.policy);
+            return Metric::from_item(item, plan.policy);
         }
         state.insert_profile(&self.published_index, Arc::new(plan))
     }
 }
 
 pub(crate) struct Registry {
+    pub(crate) scalars: crate::scalar::ScalarRegistry,
     shards: [Shard; SHARD_COUNT],
     states: StateRegistry,
     /// A keyed fast hasher avoids repeatedly paying SipHash's long-string cost while preserving
@@ -239,6 +240,7 @@ pub(crate) struct Registry {
 impl Registry {
     pub(crate) fn new() -> Self {
         Self {
+            scalars: crate::scalar::ScalarRegistry::new(),
             shards: std::array::from_fn(|_| Shard::new()),
             states: StateRegistry::default(),
             shard_hasher: RandomState::new(),
@@ -276,17 +278,19 @@ impl Registry {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|shard| {
-                let index = shard.published_index.load();
-                index
-                    .chunks
-                    .iter()
-                    .map(|chunk| chunk.published_len())
-                    .sum::<usize>()
-            })
-            .sum()
+        self.scalars.len()
+            + self
+                .shards
+                .iter()
+                .map(|shard| {
+                    let index = shard.published_index.load();
+                    index
+                        .chunks
+                        .iter()
+                        .map(|chunk| chunk.published_len())
+                        .sum::<usize>()
+                })
+                .sum::<usize>()
     }
 
     pub(crate) fn for_each_meta(&self, mut f: impl FnMut(&MetricMeta)) {

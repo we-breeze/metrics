@@ -14,7 +14,9 @@ pub enum MetricPolicy {
     Access,
 }
 
-/// JSON shape used for one profile output plan.
+/// Legacy profile format marker retained for producer source compatibility.
+///
+/// Prometheus output uses numeric counters for either variant.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ProfileFormat {
     /// ProfileUtil resource fields with numeric counters.
@@ -24,7 +26,7 @@ pub enum ProfileFormat {
 }
 
 /// One `type`/`name` view emitted from a metric snapshot.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProfileOutput {
     pub(crate) metric_type: Arc<str>,
     pub(crate) name: Arc<str>,
@@ -39,16 +41,14 @@ impl ProfileOutput {
     }
 }
 
-/// Immutable profile rendering plan for one counter slot.
+/// Immutable export plan for one counter slot.
 ///
-/// Direct outputs all receive the same drained snapshot. An aggregate output
-/// contributes that snapshot to a process-wide sum keyed by its `type` and
-/// `name`; the sum is emitted after every direct metric has been drained.
+/// Direct outputs expose the same cumulative counters. An aggregate output
+/// contributes those counters to a sum keyed by its `type` and `name`.
 #[derive(Clone, Debug)]
 pub struct ProfilePlan {
     pub(crate) identity: Arc<str>,
     pub(crate) policy: MetricPolicy,
-    pub(crate) format: ProfileFormat,
     pub(crate) outputs: Arc<[ProfileOutput]>,
     pub(crate) aggregate: Option<ProfileOutput>,
 }
@@ -59,20 +59,19 @@ impl ProfilePlan {
     pub fn new(
         identity: impl Into<Arc<str>>,
         policy: MetricPolicy,
-        format: ProfileFormat,
+        _format: ProfileFormat,
         metric_type: impl Into<Arc<str>>,
         name: impl Into<Arc<str>>,
     ) -> Self {
         Self {
             identity: identity.into(),
             policy,
-            format,
             outputs: Arc::from([ProfileOutput::new(metric_type, name)]),
             aggregate: None,
         }
     }
 
-    /// Adds another direct profile view of the same snapshot.
+    /// Adds another direct view of the same cumulative counters.
     #[must_use]
     pub fn alias(mut self, metric_type: impl Into<Arc<str>>, name: impl Into<Arc<str>>) -> Self {
         let mut outputs = self.outputs.to_vec();
@@ -81,7 +80,7 @@ impl ProfilePlan {
         self
     }
 
-    /// Adds one flush-time aggregate target for this snapshot.
+    /// Adds one scrape-time aggregate target for these counters.
     #[must_use]
     pub fn aggregate(
         mut self,

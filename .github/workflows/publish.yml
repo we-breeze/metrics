@@ -40,7 +40,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-targets
-      - run: cargo test --locked --release --lib
+      - run: cargo test --locked --all-targets --all-features
+      - run: cargo test --locked --release --lib --all-features
       - name: Verify publishable package
         run: cargo publish --locked --dry-run --registry crates-io
       - name: Push version commit and tag atomically

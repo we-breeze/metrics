@@ -19,72 +19,200 @@ only its per-chunk length; adding a new chunk copy-on-writes that shard's chunk-
 `visit` sees per-shard published prefixes, so a concurrent registration is observed either in the
 current traversal or the next one, never as uninitialized metadata.
 
-The first metric registration starts a 10-second background profile logger. It drains interval
-counters and appends ProfileUtil-compatible lines to `../logs/profile.log`; timestamps
-use the `+08:00` clock but intentionally have no timezone suffix. Set
-`BREEZE_PROFILE_LOG_PATH` before the first registration to override the path.
-The default path is relative to the process working directory.
-Metric rows whose current interval has all six counters equal to zero are not written.
-State rows and the fixed baseline liveness row are still written every interval.
+## Business-facing handles
 
-Profile log rotation is disabled by default. Set `BREEZE_PROFILE_LOG_ROTATION=hourly`
-before the first metric registration to enable hourly rotation. The active file keeps
-the configured name, while completed UTC+8 hours are archived with names such as
-`profile.log.20260921-00`; the UTC+8 offset is not included in the file name. Rotation
-does not delete or compress archives. If an archive name already exists, a numeric
-suffix such as `.1` is appended instead of overwriting it.
+Metric names are implicit. Producers provide a typed resource/category and a stable
+business identity; the reader owns Prometheus names and labels.
 
-`Slot` stores three count/duration-sum pairs: all requests, slow requests, and failed
-requests. Durations are truncated to whole microseconds when recorded. A slow failed
-request contributes to all three pairs. Six counters occupy 48 bytes; with alignment,
-each slot occupies 64 bytes. No latency buckets or `interval1`–`interval5` fields are
-maintained or logged. `success` is derived as `total - failure`, saturating at zero.
+```rust
+use brz_metrics::{CounterMetric, GaugeMetric, ConnMetric, TimingMetric, MetricType, ResourceMetric::{Req, Conn}};
+
+let count = CounterMetric::new(MetricType::Redis(Conn), "6379");
+count.inc();
+let value = GaugeMetric::new(MetricType::Redis(Conn), "6379");
+value.inc();
+value.dec();
+let requests = TimingMetric::new(MetricType::Redis(Req), "cache");
+requests.record(std::time::Duration::from_millis(60), false);
+let connections = ConnMetric::new(MetricType::Memcache(Conn), "11211");
+let connection = connections.connection(); // increment current and total
+drop(connection); // decrement current only
+```
+
+`Rpc(Req)` and `Service(Req)` use the 200 ms slow threshold. `Redis(Req)`,
+`Mysql(Req)`, `Memcache(Req)` and `Http(Req)` use 50 ms. `TimingMetric` retains
+six atomics in a 64-byte aligned slot. Counters and gauges use independent 8-byte
+slots, and their handles are copyable. `ConnMetric` combines two handles and
+provides an optional RAII guard. Registrations deduplicate by business kind, name,
+and storage kind; counter and gauge values never share the same atomic.
+
+Connection current values use `brz_conn` gauges; successful establishments use
+`brz_conn_total` counters. The Redis and Memcache SDKs pass the TCP port as `name`,
+so hosts on the same port are summed by resource. Protocol-ready connections are
+counted; retries that fail to establish/authenticate are not. Node reuse, SDK clones,
+and request reuse do not increment total. A reconnect increments it again. MySQL
+connection instrumentation is not enabled in this revision.
+
+```promql
+sum by (type, name) (brz_conn)
+sum by (type, name) (rate(brz_conn_total[5m]))
+```
+
+Other `CounterMetric` values use `brz_count_total`, and other gauges use `brz_value`.
+`Api(code)` counters use `brz_api_resp_total` with an exact `status_code` label;
+`ApiTimeout` counters use `brz_api_timeout_total`. Request timing uses the six
+families below. The existing `Metric` name and convenience constructors remain
+available, but SDK producers use the typed handle API. `visit` visits timing slots;
+`len` counts both timing and scalar slots.
+
+## Cumulative counters
+
+Registration never starts a background thread or writes files. The profile logger,
+log rotation, baseline sentinel, and `BREEZE_PROFILE_LOG_PATH` /
+`BREEZE_PROFILE_LOG_ROTATION` configuration have been removed. Counters accumulate
+for the process lifetime; `visit`, `snapshot`, and Prometheus reads never reset them.
+
+Each 64-byte `Slot` holds six `AtomicU64` counters: count and microsecond duration
+sum for all, slow, and failed operations. Recording truncates durations to whole
+microseconds. Slow failed requests contribute to all three groups. Resource metrics
+use a 50 ms slow threshold; service/API/access metrics use 200 ms. `increment()`
+changes only the total count. There are no latency buckets or P95/P99 calculations.
 
 `MetricSnapshot` exposes `total`, `success`, `failure`, `elapsed_us`, `slow`,
-`slow_elapsed_us`, and `failure_elapsed_us`. This replaces the old `elapsed_ns` and
-`intervals` fields; callers using those fields must migrate when upgrading.
+`slow_elapsed_us`, and `failure_elapsed_us`. `success` is derived as
+`total.saturating_sub(failure)`. Counter fields are independently atomic, so snapshots
+are eventually consistent rather than atomic across fields. A completed record is
+never consumed by a scrape. Under continuous writes, different fields and series
+can reflect slightly different instants.
 
-Profile rows retain `total_count`, `slow_count`, and `error_count` and add:
+## Prometheus reader
 
-| Requests | QPS | Duration sum (ms) | Average duration (ms) |
-| --- | --- | --- | --- |
-| All | `qps` | `total_time` | `avg_time` |
-| Slow | `slow_qps` | `slow_time` | `slow_avg_time` |
-| Failed | `error_qps` | `error_time` | `error_avg_time` |
+```rust
+use brz_metrics::{Metric, PrometheusReader};
+use std::io::Read;
+use std::time::Duration;
 
-QPS uses the actual elapsed sampling window measured by a monotonic clock, including
-logging delays and intervals skipped because the log file could not be opened or
-rotated. Rates and durations are JSON strings with exactly two decimal places;
-duration sums and averages are in **milliseconds**. An average with a zero count is
-`"0.00"`. `slowThreshold` is also in milliseconds, with two decimal places. Resource
-counts remain JSON numbers; access-statistic counts remain strings. Access-statistic
-`avg_tps` now reports the same measured rate as `qps`; percentile, min/max TPS, and
-business-exception fields remain compatibility placeholders.
+Metric::redis("cache").record(Duration::from_millis(60), false);
+let mut reader = PrometheusReader::new();
+let mut output = String::new();
+reader.read_to_string(&mut output)?;
+assert!(output.contains("brz_req_total"));
+# Ok::<(), std::io::Error>(())
+```
 
-Counters are read and drained independently, so snapshots and log windows are
-eventually consistent rather than atomic across all six fields. A record racing a
-sample can put its count and duration in neighboring windows. Rows containing only
-duration data are retained with zero QPS/average and nonzero duration sums, so those
-drained values are not silently discarded. Log writes remain best effort: an I/O
-failure after counters have been drained can lose that batch.
+The six metric families are cumulative **counters**, each with `type` and `name`
+labels. Duration sums are rendered in **seconds**, rounded to exactly two decimal
+places. Internal counters retain microsecond precision; rounding happens only after
+source counters are summed. Exposition has 0.01-second resolution, so low-traffic
+series may show unchanged duration sums across scrapes before a rounded increment
+appears. Counts are not rounded.
 
-HTTP server route metrics use profile types `API`, `API3XX`, `API4XX`,
-`API5XX`, and `APITO`, all with the unmodified route template as `name` and the
-service latency policy (200 ms slow threshold). `API` represents 2xx responses.
+| Group | Count | Duration sum |
+| --- | --- | --- |
+| All | `brz_req_total` | `brz_req_duration_secs_total` |
+| Failed | `brz_err_total` | `brz_err_duration_secs_total` |
+| Slow | `brz_slow_total` | `brz_slow_duration_secs_total` |
 
-MySQL 客户端使用 `Metric::mysql(name)` 注册 `MYSQL` 类型指标，按 host 和 get/list/update/transaction 操作聚合，沿用资源指标的 50ms 慢调用阈值。
+For example:
+
+```text
+# TYPE brz_req_total counter
+brz_req_total{type="REDIS",name="cache"} 1
+```
+
+Zero samples remain present once registered. A reader captures the registered export
+metadata and current RPC state at construction; requests continue accumulating while
+it is read. Registrations after its per-shard prefixes were captured appear in the
+next reader. Counter samples are loaded one family at a time. The encoded buffer holds
+one sample at a time, rather than the entire response. Captured metadata takes memory
+proportional to the exported views, sharing label strings; construction sorts these
+views to group families and merge duplicate series.
+
+Existing `producer::ProfilePlan` and `register_profile` APIs remain available for
+source compatibility. `ProfileFormat` is an ignored compatibility marker. Aliases
+export the same slot under their declared `type`/`name`. Aggregate targets sum source
+slots during exposition. Duplicate views of the same slot count once; distinct slots
+with identical `type`/`name` are summed, including overlaps between direct and aggregate
+outputs. `visit` exposes direct aliases and leaves aggregation to the reader. When
+summing in PromQL, select the desired type/name to avoid counting aliases twice.
+
+RPC state finite numeric fields are exposed as
+`brz_rpc_state{type="MOTAN_CLUSTER_STAT",name="...",field="..."}` gauges.
+Non-numeric, NaN, and infinite fields remain stored but are omitted from exposition.
+
+### HTTP integration
+
+The application owns the `/metrics` route, response body, and authentication. Use
+`brz_metrics::prometheus::CONTENT_TYPE` for the response Content-Type
+(`text/plain; version=0.0.4; charset=utf-8`). Create a fresh reader for every scrape.
+The library does not start a server or register a service-discovery target.
+
+Enable the optional Tokio adapter in a release containing this change (or use this
+checkout as a local path dependency):
+
+```toml
+brz-metrics = { version = "0.0.9", features = ["tokio"] }
+```
+
+`PrometheusReader` then implements both `std::io::Read` and
+`tokio::io::AsyncRead`. Its async reads copy initialized bytes directly to `ReadBuf`
+and return `Ready`: this is in-memory encoding, with no runtime or background task
+required. The HTTP transport handles network I/O and backpressure. For frameworks
+accepting a stream, the application can add `tokio-util` with its `io` feature and use:
+
+```rust,ignore
+let stream = tokio_util::io::ReaderStream::new(brz_metrics::PrometheusReader::new());
+// Pass `stream` to the HTTP framework's streaming response body.
+```
+
+### Queries
+
+QPS, error ratio, and average latency over the chosen window are computed by Prometheus:
+
+```promql
+rate(brz_req_total[5m])
+rate(brz_err_total[5m]) / rate(brz_req_total[5m])
+rate(brz_req_duration_secs_total[5m]) / rate(brz_req_total[5m])
+```
+
+A zero rate denominator produces NaN. For multiple instances, apply `rate` to each
+series first, then aggregate the numerator and denominator separately. Prometheus
+recognizes process-restart counter resets. Do not interpret these values as interval
+counts or precomputed QPS.
+
+### Exact HTTP status codes
+
+`Metric::api(name)` records the six all-request counters with type `API`.
+`CounterMetric::new(MetricType::Api(code), name)` uses the internal `Api(u16)` variant and exposes
+only a count:
+
+```text
+brz_api_resp_total{type="API",name="/users/:id",status_code="503"} 12
+```
+
+Codes are bounded to 100..=599. There is no `status_class` label. Producers register
+only observed codes and call `inc()`; they record the overall request once in
+`Metric::api(name)`, including its timing and success. Per-code counters do not repeat
+the six duration/error/slow series. `CounterMetric::new(MetricType::ApiTimeout, name)` exports only
+`brz_api_timeout_total{type="API",name="..."}` and is incremented for timeouts.
+A timed-out response may also have an HTTP status, such as 408; its status counter and
+its timeout counter describe different dimensions of the same overall request.
+
+The sibling HTTP server implements lazy per-code handle caching, with all requests
+in `API`, errors for statuses >=400 or timeouts, and the existing 200 ms slow threshold.
+Legacy `api_3xx`, `api_4xx`, and `api_5xx` constructors remain for source compatibility;
+the new HTTP server does not use them. `visit` retains its legacy three-argument shape:
+exact-code slots are reported as `API_RESPONSE`; the code label is available in the
+Prometheus reader. MySQL metrics retain type `MYSQL` and the 50 ms slow threshold.
 
 ## Operational safety
 
-Use stable, bounded metric names such as route templates. The process-wide
-registry retains metric names and RPC state keys for the lifetime of the
-process; raw URLs, user IDs, or arbitrary request values can cause unbounded
-memory growth and disclose data in logs. JSON strings are escaped when written,
-but escaping does not redact sensitive values.
-
-Configure a log directory writable only by the service account. The logger follows
-the configured filesystem path and does not enforce a disk quota or delete old files.
-Leave built-in rotation disabled if an external log rotator manages the file.
+Use stable, bounded names such as route templates. The process registry retains
+metric names and RPC state keys for its lifetime. Avoid raw URLs, user IDs, or arbitrary
+request values. Prometheus labels are escaped but are not redacted. Each full exported view
+adds six counter series; observed API codes and timeout metrics each add one. Aliases
+and aggregates add full views. Concurrent scrapes each
+capture their own export metadata, so account for scrape concurrency when sizing memory.
 
 ## Installation
 
@@ -93,13 +221,14 @@ library name:
 
 ```toml
 [dependencies]
-brz-metrics = "0.0.4"
+brz-metrics = "0.0.9"
 ```
 
 ## CI and publishing
 
 Pushes and pull requests run rustfmt, Clippy with warnings denied, all test
-and benchmark targets in test mode, and release-mode library tests. This crate
+and benchmark targets with default and all features, and release-mode library tests
+with all features. This crate
 has no Loom models; its concurrent registration and traversal tests run in
 both debug and release modes.
 
@@ -141,5 +270,5 @@ library name. Existing explicit dependency aliases remain supported.
 
 ```toml
 [dependencies]
-brz-metrics = "0.0.4"
+brz-metrics = "0.0.9"
 ```

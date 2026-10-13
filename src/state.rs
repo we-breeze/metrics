@@ -12,7 +12,7 @@ pub(crate) enum StateType {
 }
 
 impl StateType {
-    pub(crate) const fn profile_type(self) -> &'static str {
+    pub(crate) const fn metric_type(self) -> &'static str {
         match self {
             Self::Rpc => "MOTAN_CLUSTER_STAT",
         }
@@ -71,8 +71,8 @@ impl StateRegistry {
         drop(states);
 
         snapshots.sort_unstable_by(|left, right| {
-            (left.state_type.profile_type(), left.name.as_ref())
-                .cmp(&(right.state_type.profile_type(), right.name.as_ref()))
+            (left.state_type.metric_type(), left.name.as_ref())
+                .cmp(&(right.state_type.metric_type(), right.name.as_ref()))
         });
         for snapshot in &mut snapshots {
             snapshot

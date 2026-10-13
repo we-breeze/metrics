@@ -17,7 +17,7 @@ pub(crate) struct Slot {
     failure_elapsed_us: AtomicU64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ItemPtr(NonNull<Slot>);
 
 unsafe impl Send for ItemPtr {}
@@ -36,28 +36,52 @@ impl ItemPtr {
     }
 }
 
+/// Business resource metric category, independent of the exported metric name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum MetricType {
-    /// Process logging counters such as bounded-queue drops.
+pub enum ResourceMetric {
+    Req,
+    Conn,
+}
+
+/// Business identity supplied by producers when registering a metric.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MetricType {
     Log,
-    Redis,
-    Mysql,
-    Mc,
+    Redis(ResourceMetric),
+    Mysql(ResourceMetric),
+    Memcache(ResourceMetric),
     McDetail,
-    /// One outbound HTTP request, keyed by its stable endpoint URL.
-    Http,
-    /// Whole-request HTTP timing, including response-body consumption.
+    Http(ResourceMetric),
     HttpAll,
-    /// One inbound API route and HTTP status class.
-    Api,
+    ApiAll,
+    Api(u16),
     Api3xx,
     Api4xx,
     Api5xx,
     ApiTimeout,
-    /// ProfileUtil service metric. This uses the resource-shaped JSON fields
-    /// but has the service slow threshold expected by legacy dashboards.
-    Service,
+    Rpc(ResourceMetric),
+    Service(ResourceMetric),
     RpcServiceWhole,
+}
+
+impl MetricType {
+    pub(crate) fn is_conn(self) -> bool {
+        matches!(
+            self,
+            Self::Redis(ResourceMetric::Conn)
+                | Self::Mysql(ResourceMetric::Conn)
+                | Self::Memcache(ResourceMetric::Conn)
+                | Self::Http(ResourceMetric::Conn)
+                | Self::Rpc(ResourceMetric::Conn)
+                | Self::Service(ResourceMetric::Conn)
+        )
+    }
+
+    pub(crate) fn validate(self) {
+        if let Self::Api(code) = self {
+            assert!((100..=599).contains(&code), "invalid HTTP status code");
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -69,34 +93,40 @@ impl MetricType {
     #[inline]
     pub(crate) fn policy(self) -> MetricPolicy {
         match self {
-            Self::Log | Self::Redis | Self::Mysql | Self::Mc | Self::McDetail | Self::Http => {
-                MetricPolicy::Resource
-            }
+            Self::Log
+            | Self::Redis(_)
+            | Self::Mysql(_)
+            | Self::Memcache(_)
+            | Self::McDetail
+            | Self::Http(_) => MetricPolicy::Resource,
             Self::HttpAll
-            | Self::Service
-            | Self::Api
+            | Self::Service(_)
+            | Self::ApiAll
+            | Self::Api(_)
             | Self::Api3xx
             | Self::Api4xx
             | Self::Api5xx
             | Self::ApiTimeout => MetricPolicy::Service,
-            Self::RpcServiceWhole => MetricPolicy::Access,
+            Self::Rpc(_) | Self::RpcServiceWhole => MetricPolicy::Access,
         }
     }
 
     pub(crate) fn output(self) -> (&'static str, ProfileFormat) {
         match self {
             Self::Log => ("LOG", ProfileFormat::Resource),
-            Self::Redis => ("REDIS", ProfileFormat::Resource),
-            Self::Mysql => ("MYSQL", ProfileFormat::Resource),
-            Self::Mc => ("MC", ProfileFormat::Resource),
+            Self::Redis(_) => ("REDIS", ProfileFormat::Resource),
+            Self::Mysql(_) => ("MYSQL", ProfileFormat::Resource),
+            Self::Memcache(_) => ("MC", ProfileFormat::Resource),
             Self::McDetail => ("MCDETAIL", ProfileFormat::Resource),
-            Self::Http | Self::HttpAll => ("HTTP", ProfileFormat::Resource),
-            Self::Api => ("API", ProfileFormat::Resource),
+            Self::Http(_) | Self::HttpAll => ("HTTP", ProfileFormat::Resource),
+            Self::ApiAll => ("API", ProfileFormat::Resource),
+            Self::Api(_) => ("API_RESPONSE", ProfileFormat::Resource),
             Self::Api3xx => ("API3XX", ProfileFormat::Resource),
             Self::Api4xx => ("API4XX", ProfileFormat::Resource),
             Self::Api5xx => ("API5XX", ProfileFormat::Resource),
             Self::ApiTimeout => ("APITO", ProfileFormat::Resource),
-            Self::Service => ("SERVICE", ProfileFormat::Resource),
+            Self::Service(_) => ("SERVICE", ProfileFormat::Resource),
+            Self::Rpc(_) => ("RPC", ProfileFormat::AccessStatistic),
             Self::RpcServiceWhole => ("RPC_SERVICE_WHOLE", ProfileFormat::AccessStatistic),
         }
     }
@@ -116,7 +146,7 @@ impl MetricPolicy {
     }
 }
 
-/// An eventually-consistent view of the current interval's counters.
+/// An eventually-consistent view of the process-lifetime cumulative counters.
 /// Duration sums use microseconds. Slow and failed operations may overlap.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MetricSnapshot {
@@ -137,13 +167,23 @@ pub struct Metric {
 }
 
 impl Metric {
-    pub(crate) fn new(item: ItemPtr, policy: MetricPolicy) -> Self {
+    /// Registers cumulative request counts and timing for one business object.
+    pub fn new(kind: MetricType, name: &str) -> Self {
+        kind.validate();
+        assert!(
+            !kind.is_conn(),
+            "connection values use CounterMetric/GaugeMetric/ConnMetric"
+        );
+        crate::registry().register(name, kind)
+    }
+
+    pub(crate) fn from_item(item: ItemPtr, policy: MetricPolicy) -> Self {
         Self { item, policy }
     }
 
     /// Records a completed operation, truncating its duration to whole microseconds.
     ///
-    /// Profile output formats durations in milliseconds with two decimal places.
+    /// Prometheus output converts microsecond sums to seconds.
     /// A slow failed operation contributes to all three count/duration pairs.
     #[inline]
     pub fn record(&self, elapsed: Duration, success: bool) {
@@ -193,17 +233,30 @@ pub(crate) fn snapshot(item: ItemPtr) -> MetricSnapshot {
     )
 }
 
-#[inline]
-pub(crate) fn drain(item: ItemPtr) -> MetricSnapshot {
-    let slot = item.as_ref();
-    MetricSnapshot::from_counters(
-        slot.count.swap(0, Ordering::AcqRel),
-        slot.elapsed_us.swap(0, Ordering::AcqRel),
-        slot.slow_count.swap(0, Ordering::AcqRel),
-        slot.slow_elapsed_us.swap(0, Ordering::AcqRel),
-        slot.failure_count.swap(0, Ordering::AcqRel),
-        slot.failure_elapsed_us.swap(0, Ordering::AcqRel),
-    )
+/// The six exported counters, ordered by Prometheus metric family.
+#[derive(Clone, Copy)]
+pub(crate) enum Counter {
+    Total,
+    Failure,
+    Slow,
+    Elapsed,
+    FailureElapsed,
+    SlowElapsed,
+}
+
+impl Counter {
+    pub(crate) fn read(self, item: ItemPtr) -> u64 {
+        let slot = item.as_ref();
+        let counter = match self {
+            Self::Total => &slot.count,
+            Self::Failure => &slot.failure_count,
+            Self::Slow => &slot.slow_count,
+            Self::Elapsed => &slot.elapsed_us,
+            Self::FailureElapsed => &slot.failure_elapsed_us,
+            Self::SlowElapsed => &slot.slow_elapsed_us,
+        };
+        counter.load(Ordering::Relaxed)
+    }
 }
 
 impl MetricSnapshot {
@@ -226,27 +279,6 @@ impl MetricSnapshot {
             failure_elapsed_us,
         }
     }
-
-    pub(crate) fn merge(&mut self, other: Self) {
-        self.total = self.total.saturating_add(other.total);
-        self.failure = self.failure.saturating_add(other.failure);
-        self.success = self.total.saturating_sub(self.failure);
-        self.elapsed_us = self.elapsed_us.saturating_add(other.elapsed_us);
-        self.slow = self.slow.saturating_add(other.slow);
-        self.slow_elapsed_us = self.slow_elapsed_us.saturating_add(other.slow_elapsed_us);
-        self.failure_elapsed_us = self
-            .failure_elapsed_us
-            .saturating_add(other.failure_elapsed_us);
-    }
-
-    pub(crate) fn is_empty(self) -> bool {
-        self.total == 0
-            && self.elapsed_us == 0
-            && self.slow == 0
-            && self.slow_elapsed_us == 0
-            && self.failure == 0
-            && self.failure_elapsed_us == 0
-    }
 }
 
 #[cfg(test)]
@@ -263,8 +295,8 @@ mod tests {
     #[test]
     fn microsecond_counters_cover_thresholds_and_overlapping_failures() {
         for (kind, threshold_us) in [
-            (MetricType::Redis, 50_000),
-            (MetricType::Service, 200_000),
+            (MetricType::Redis(ResourceMetric::Req), 50_000),
+            (MetricType::Service(ResourceMetric::Req), 200_000),
             (MetricType::RpcServiceWhole, 200_000),
         ] {
             let registry = Registry::new();
@@ -292,7 +324,7 @@ mod tests {
     #[test]
     fn oversized_duration_is_clamped_in_microseconds() {
         let registry = Registry::new();
-        let metric = registry.register("duration-max", MetricType::Redis);
+        let metric = registry.register("duration-max", MetricType::Redis(ResourceMetric::Req));
         metric.record(Duration::MAX, false);
         let snapshot = metric.snapshot();
         assert_eq!(snapshot.total, 1);
@@ -302,12 +334,11 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_record_and_drain_preserve_all_six_counters() {
+    fn concurrent_record_and_snapshot_preserve_cumulative_counters() {
         const WORKERS: u64 = 4;
         const RECORDS: u64 = 10_000;
         let registry = Registry::new();
-        let metric = registry.register("concurrent", MetricType::Redis);
-        let mut sum = MetricSnapshot::default();
+        let metric = registry.register("concurrent", MetricType::Redis(ResourceMetric::Req));
         std::thread::scope(|scope| {
             let workers: Vec<_> = (0..WORKERS)
                 .map(|_| {
@@ -322,70 +353,32 @@ mod tests {
                     })
                 })
                 .collect();
-            let mut collect = || {
-                let sample = drain(metric.item);
-                if !sample.is_empty() {
-                    sum.merge(sample);
-                }
-            };
+            let mut previous = MetricSnapshot::default();
             while workers.iter().any(|worker| !worker.is_finished()) {
-                collect();
+                let current = metric.snapshot();
+                assert!(current.total >= previous.total);
+                assert!(current.failure >= previous.failure);
+                assert!(current.slow >= previous.slow);
+                assert!(current.elapsed_us >= previous.elapsed_us);
+                assert!(current.failure_elapsed_us >= previous.failure_elapsed_us);
+                assert!(current.slow_elapsed_us >= previous.slow_elapsed_us);
+                previous = current;
             }
             for worker in workers {
                 worker.join().unwrap();
             }
-            collect();
         });
         let total = WORKERS * RECORDS;
-        assert_eq!(sum.total, total);
-        assert_eq!(sum.success, total / 2);
-        assert_eq!(sum.failure, total / 2);
-        assert_eq!(sum.slow, total / 2);
-        assert_eq!(sum.elapsed_us, total / 2 * 255_000);
-        assert_eq!(sum.slow_elapsed_us, total / 2 * 250_000);
-        assert_eq!(sum.failure_elapsed_us, total / 2 * 250_000);
-        assert_eq!(metric.snapshot(), MetricSnapshot::default());
-    }
-
-    #[test]
-    fn duration_only_windows_are_logged_instead_of_discarded() {
-        for kind in [MetricType::Redis, MetricType::RpcServiceWhole] {
-            let registry = Registry::new();
-            let metric = registry.register("partial", kind);
-            // Model a sample boundary that falls between duration and count updates.
-            let slot = metric.item.as_ref();
-            slot.elapsed_us.store(12_346, Ordering::Relaxed);
-            slot.slow_elapsed_us.store(2_000, Ordering::Relaxed);
-            slot.failure_elapsed_us.store(3_000, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "metrics-partial-{}-{:?}.log",
-                std::process::id(),
-                kind,
-            ));
-            let _ = std::fs::remove_file(&path);
-            registry
-                .write_profile_log(
-                    &path,
-                    chrono::Utc::now().fixed_offset(),
-                    &mut Vec::new(),
-                    Duration::from_secs(10),
-                )
-                .unwrap();
-            let content = std::fs::read_to_string(&path).unwrap();
-            std::fs::remove_file(path).unwrap();
-            let rows: Vec<serde_json::Value> = content
-                .lines()
-                .map(|line| serde_json::from_str(&line[20..]).unwrap())
-                .collect();
-            assert_eq!(rows.len(), 2);
-            assert_eq!(rows[0]["name"], "partial");
-            assert_eq!(rows[0]["total_time"], "12.35");
-            assert_eq!(rows[0]["slow_time"], "2.00");
-            assert_eq!(rows[0]["error_time"], "3.00");
-            for field in ["avg_time", "slow_avg_time", "error_avg_time", "qps"] {
-                assert_eq!(rows[0][field], "0.00");
-            }
-            assert_eq!(metric.snapshot(), MetricSnapshot::default());
-        }
+        let expected = MetricSnapshot {
+            total,
+            success: total / 2,
+            failure: total / 2,
+            slow: total / 2,
+            elapsed_us: total / 2 * 255_000,
+            slow_elapsed_us: total / 2 * 250_000,
+            failure_elapsed_us: total / 2 * 250_000,
+        };
+        assert_eq!(metric.snapshot(), expected);
+        assert_eq!(metric.snapshot(), expected);
     }
 }
