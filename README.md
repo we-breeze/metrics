@@ -27,9 +27,9 @@ business identity; the reader owns Prometheus names and labels.
 ```rust
 use brz_metrics::{CounterMetric, GaugeMetric, ConnMetric, TimingMetric, MetricType, ResourceMetric::{Req, Conn}};
 
-let count = CounterMetric::new(MetricType::Redis(Conn), "6379");
+let count = CounterMetric::new(MetricType::Redis(Conn), "cache.example.com:6379");
 count.inc();
-let value = GaugeMetric::new(MetricType::Redis(Conn), "6379");
+let value = GaugeMetric::new(MetricType::Redis(Conn), "cache.example.com:6379");
 value.inc();
 value.dec();
 let requests = TimingMetric::new(MetricType::Redis(Req), "cache");
@@ -47,8 +47,9 @@ provides an optional RAII guard. Registrations deduplicate by business kind, nam
 and storage kind; counter and gauge values never share the same atomic.
 
 Connection current values use `brz_conn` gauges; successful establishments use
-`brz_conn_total` counters. The Redis and Memcache SDKs pass the TCP port as `name`,
-so hosts on the same port are summed by resource. Protocol-ready connections are
+`brz_conn_total` counters. Redis uses its configured logical `host:port` as `name`,
+matching request metrics; Memcache groups connections by TCP port across hosts.
+Protocol-ready connections are
 counted; retries that fail to establish/authenticate are not. Node reuse, SDK clones,
 and request reuse do not increment total. A reconnect increments it again. MySQL
 connection instrumentation is not enabled in this revision.
