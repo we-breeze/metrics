@@ -152,7 +152,7 @@ Enable the optional Tokio adapter in a release containing this change (or use th
 checkout as a local path dependency):
 
 ```toml
-brz-metrics = { version = "0.0.9", features = ["tokio"] }
+brz-metrics = { version = "0.0.10", features = ["tokio"] }
 ```
 
 `PrometheusReader` then implements both `std::io::Read` and
@@ -222,7 +222,7 @@ library name:
 
 ```toml
 [dependencies]
-brz-metrics = "0.0.9"
+brz-metrics = "0.0.10"
 ```
 
 ## CI and publishing
@@ -271,5 +271,5 @@ library name. Existing explicit dependency aliases remain supported.
 
 ```toml
 [dependencies]
-brz-metrics = "0.0.9"
+brz-metrics = "0.0.10"
 ```
