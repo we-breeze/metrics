@@ -12,15 +12,13 @@ use std::sync::Arc;
 /// Content-Type for an HTTP response containing this reader's output.
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-const FAMILIES: [(&str, Counter, bool); 12] = [
+const FAMILIES: [(&str, Counter, bool); 10] = [
     ("brz_req_total", Counter::Total, false),
     ("brz_err_total", Counter::Failure, false),
     ("brz_slow_total", Counter::Slow, false),
     ("brz_req_duration_secs_total", Counter::Elapsed, true),
     ("brz_err_duration_secs_total", Counter::FailureElapsed, true),
     ("brz_slow_duration_secs_total", Counter::SlowElapsed, true),
-    ("brz_api_resp_total", Counter::Total, false),
-    ("brz_api_timeout_total", Counter::Total, false),
     ("brz_conn_total", Counter::Total, false),
     ("brz_count_total", Counter::Total, false),
     ("brz_conn", Counter::Total, false),
@@ -30,6 +28,7 @@ const FAMILIES: [(&str, Counter, bool); 12] = [
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 enum SourceKind {
     Full,
+    ApiSummary,
     Api(u16),
     Timeout,
     ConnCounter,
@@ -42,12 +41,12 @@ impl SourceKind {
     fn supports(self, family: usize) -> bool {
         match self {
             Self::Full => family < 6,
-            Self::Api(_) => family == 6,
-            Self::Timeout => family == 7,
-            Self::ConnCounter => family == 8,
-            Self::Count => family == 9,
-            Self::ConnGauge => family == 10,
-            Self::Gauge => family == 11,
+            Self::ApiSummary => (1..6).contains(&family),
+            Self::Api(_) | Self::Timeout => family == 0,
+            Self::ConnCounter => family == 6,
+            Self::Count => family == 7,
+            Self::ConnGauge => family == 8,
+            Self::Gauge => family == 9,
         }
     }
 }
@@ -115,6 +114,7 @@ impl PrometheusReader {
                     let (metric_type, source_kind) = match kind {
                         MetricType::Api(code) => ("API", SourceKind::Api(*code)),
                         MetricType::ApiTimeout => ("API", SourceKind::Timeout),
+                        MetricType::ApiAll => ("API", SourceKind::ApiSummary),
                         _ => (kind.output().0, SourceKind::Full),
                     };
                     add(
@@ -133,19 +133,41 @@ impl PrometheusReader {
                 ProfileMeta::Resource { labels, kind } => {
                     add(
                         ProfileOutput {
-                            metric_type: Arc::from(kind.output().0),
+                            metric_type: Arc::from(match kind {
+                                MetricType::Api(_) | MetricType::ApiTimeout => "API",
+                                _ => kind.output().0,
+                            }),
                             name: Arc::clone(&labels.name),
                             resource: Some(labels.clone()),
                         },
-                        SourceKind::Full,
+                        match kind {
+                            MetricType::ApiAll => SourceKind::ApiSummary,
+                            MetricType::Api(code) => SourceKind::Api(*code),
+                            MetricType::ApiTimeout => SourceKind::Timeout,
+                            _ => SourceKind::Full,
+                        },
                     );
                 }
                 ProfileMeta::Fanout(plan) => {
                     for output in plan.outputs.iter() {
-                        add(output.clone(), SourceKind::Full);
+                        add(
+                            output.clone(),
+                            if &*output.metric_type == "API" {
+                                SourceKind::ApiSummary
+                            } else {
+                                SourceKind::Full
+                            },
+                        );
                     }
                     if let Some(output) = &plan.aggregate {
-                        add(output.clone(), SourceKind::Full);
+                        add(
+                            output.clone(),
+                            if &*output.metric_type == "API" {
+                                SourceKind::ApiSummary
+                            } else {
+                                SourceKind::Full
+                            },
+                        );
                     }
                 }
             }
@@ -206,11 +228,7 @@ impl PrometheusReader {
             let (name, counter, seconds) = FAMILIES[self.family];
             if !self.header {
                 self.header = true;
-                let mode = if self.family >= 10 {
-                    "gauge"
-                } else {
-                    "counter"
-                };
+                let mode = if self.family >= 8 { "gauge" } else { "counter" };
                 writeln!(self.buffer, "# TYPE {name} {mode}").unwrap();
                 return true;
             }
@@ -254,11 +272,17 @@ impl PrometheusReader {
                         label(&mut self.buffer, role.label());
                     }
                 }
-                if let SourceKind::Api(code) = kind {
-                    write!(self.buffer, "\",status_code=\"{code}").unwrap();
+                match kind {
+                    SourceKind::Api(code) => {
+                        write!(self.buffer, "\",status_code=\"{code}").unwrap();
+                    }
+                    SourceKind::Timeout => {
+                        self.buffer.extend_from_slice(b"\",status_code=\"timeout")
+                    }
+                    _ => {}
                 }
                 self.buffer.extend_from_slice(b"\"} ");
-                if self.family >= 10 {
+                if self.family >= 8 {
                     writeln!(self.buffer, "{gauge}").unwrap();
                 } else if seconds {
                     // Round the cumulative microseconds to hundredths of a second.

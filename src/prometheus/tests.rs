@@ -134,7 +134,7 @@ fn labels_are_escaped_and_zero_series_are_retained() {
     let expected = format!("type=\"{escaped}\",name=\"{escaped}\"");
     assert_eq!(
         output.lines().filter(|line| line.starts_with('#')).count(),
-        13
+        11
     );
     assert_eq!(
         output
@@ -356,7 +356,7 @@ fn typed_counter_gauge_rpc_and_service_use_implicit_families() {
         "4"
     );
     assert_eq!(
-        values["brz_api_resp_total{type=\"API\",name=\"typed-export-test\",status_code=\"503\"}"],
+        values["brz_req_total{type=\"API\",name=\"typed-export-test\",status_code=\"503\"}"],
         "1"
     );
     assert_eq!(
@@ -386,26 +386,32 @@ fn exact_api_codes_are_labels_and_export_only_response_counts() {
     registry
         .register("/users/:id", MetricType::Api(503))
         .increment();
+    all.record(Duration::from_millis(10), false);
     registry
         .register("/users/:id", MetricType::ApiTimeout)
         .increment();
+    all.record(Duration::from_millis(50), false);
     let output = text(&registry);
     let values = samples(&output);
-    assert_eq!(values.len(), 6 + 4 + 1);
+    assert_eq!(values.len(), 5 + 4 + 1);
+    assert!(!values.contains_key("brz_req_total{type=\"API\",name=\"/users/:id\"}"));
+    let total: u64 = values
+        .iter()
+        .filter(|(key, _)| key.starts_with("brz_req_total{"))
+        .map(|(_, value)| value.parse::<u64>().unwrap())
+        .sum();
+    assert_eq!(total, all.snapshot().total);
+    assert_eq!(total, 6);
     assert_eq!(
-        values["brz_req_total{type=\"API\",name=\"/users/:id\"}"],
+        values["brz_err_total{type=\"API\",name=\"/users/:id\"}"],
         "4"
     );
     assert_eq!(
-        values["brz_err_total{type=\"API\",name=\"/users/:id\"}"],
+        values["brz_req_total{type=\"API\",name=\"/users/:id\",status_code=\"503\"}"],
         "2"
     );
     assert_eq!(
-        values["brz_api_resp_total{type=\"API\",name=\"/users/:id\",status_code=\"503\"}"],
-        "2"
-    );
-    assert_eq!(
-        values["brz_api_timeout_total{type=\"API\",name=\"/users/:id\"}"],
+        values["brz_req_total{type=\"API\",name=\"/users/:id\",status_code=\"timeout\"}"],
         "1"
     );
     assert!(!output.contains("status_class"));
@@ -414,8 +420,10 @@ fn exact_api_codes_are_labels_and_export_only_response_counts() {
             .lines()
             .filter(|line| line.contains("status_code="))
             .count(),
-        4
+        5
     );
+    assert!(!output.contains("brz_api_resp_total"));
+    assert!(!output.contains("brz_api_timeout_total"));
     assert_eq!(text(&registry), output);
 }
 

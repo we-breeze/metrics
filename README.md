@@ -61,9 +61,10 @@ sum by (type, name) (rate(brz_conn_total[5m]))
 ```
 
 Other `CounterMetric` values use `brz_count_total`, and other gauges use `brz_value`.
-`Api(code)` counters use `brz_api_resp_total` with an exact `status_code` label;
-`ApiTimeout` counters use `brz_api_timeout_total`. Request timing uses the six
-families below. The existing `Metric` name and convenience constructors remain
+`Api(code)` and `ApiTimeout` counters use `brz_req_total` with
+`status_code="200"` etc. or `status_code="timeout"`. API timing exports the
+five error/slow/duration families; its unlabeled total is not exported. Other
+resource timing uses all six families below. The existing `Metric` name and convenience constructors remain
 available, but SDK producers use the typed handle API. `visit` visits timing slots;
 `len` counts both timing and scalar slots.
 
@@ -153,7 +154,7 @@ Enable the optional Tokio adapter in a release containing this change (or use th
 checkout as a local path dependency):
 
 ```toml
-brz-metrics = { version = "0.0.11", features = ["tokio"] }
+brz-metrics = { version = "0.0.12", features = ["tokio"] }
 ```
 
 `PrometheusReader` then implements both `std::io::Read` and
@@ -184,21 +185,33 @@ counts or precomputed QPS.
 
 ### Exact HTTP status codes
 
-`Metric::api(name)` records the six all-request counters with type `API`.
-`CounterMetric::new(MetricType::Api(code), name)` uses the internal `Api(u16)` variant and exposes
-only a count:
+`Metric::api(name)` keeps the all-request timing snapshot with type `API`.
+Its error count, slow count and three duration sums are exported, while its
+unlabeled request total is suppressed to avoid counting the same request twice.
+`CounterMetric::new(MetricType::Api(code), name)` exports one count:
 
 ```text
-brz_api_resp_total{type="API",name="/users/:id",status_code="503"} 12
+brz_req_total{type="API",name="/users/:id",status_code="503"} 12
+brz_req_total{type="API",name="/users/:id",status_code="timeout"} 1
 ```
 
-Codes are bounded to 100..=599. There is no `status_class` label. Producers register
-only observed codes and call `inc()`; they record the overall request once in
-`Metric::api(name)`, including its timing and success. Per-code counters do not repeat
-the six duration/error/slow series. `CounterMetric::new(MetricType::ApiTimeout, name)` exports only
-`brz_api_timeout_total{type="API",name="..."}` and is incremented for timeouts.
-A timed-out response may also have an HTTP status, such as 408; its status counter and
-its timeout counter describe different dimensions of the same overall request.
+Codes are bounded to 100..=599. Producers increment exactly one result counter
+and record the overall timing once. `MetricType::ApiTimeout` retains the same
+registration API and exports `status_code="timeout"` in `brz_req_total`.
+Server deadline expiry is represented by `timeout`, including when the server
+synthesizes a 408 response; it does not also increment 408. A normal business
+response with status 408 or 504 retains that numeric code. All timeouts are
+errors, but only durations reaching the 200 ms threshold count as slow.
+`brz_api_resp_total` and `brz_api_timeout_total` are no longer exported.
+
+```promql
+sum by (name) (rate(brz_req_total{type="API"}[1m]))
+sum by (name) (rate(brz_req_total{type="API",status_code="timeout"}[1m]))
+sum by (name) (rate(brz_err_total{type="API"}[1m]))
+  / sum by (name) (rate(brz_req_total{type="API"}[1m]))
+sum by (name) (rate(brz_req_duration_secs_total{type="API"}[1m]))
+  / sum by (name) (rate(brz_req_total{type="API"}[1m]))
+```
 
 The sibling HTTP server implements lazy per-code handle caching, with all requests
 in `API`, errors for statuses >=400 or timeouts, and the existing 200 ms slow threshold.
@@ -223,7 +236,7 @@ library name:
 
 ```toml
 [dependencies]
-brz-metrics = "0.0.11"
+brz-metrics = "0.0.12"
 ```
 
 ## CI and publishing
@@ -272,7 +285,7 @@ library name. Existing explicit dependency aliases remain supported.
 
 ```toml
 [dependencies]
-brz-metrics = "0.0.11"
+brz-metrics = "0.0.12"
 ```
 
 ## Resource metadata and allocation-free updates
