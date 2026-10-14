@@ -125,8 +125,19 @@ impl PrometheusReader {
                                     .or_insert_with(|| Arc::from(metric_type)),
                             ),
                             name: Arc::clone(name),
+                            resource: None,
                         },
                         source_kind,
+                    );
+                }
+                ProfileMeta::Resource { labels, kind } => {
+                    add(
+                        ProfileOutput {
+                            metric_type: Arc::from(kind.output().0),
+                            name: Arc::clone(&labels.name),
+                            resource: Some(labels.clone()),
+                        },
+                        SourceKind::Full,
                     );
                 }
                 ProfileMeta::Fanout(plan) => {
@@ -160,6 +171,7 @@ impl PrometheusReader {
                             .or_insert_with(|| Arc::from(metric_type)),
                     ),
                     name: Arc::clone(&meta.name),
+                    resource: meta.resource.clone(),
                 },
                 kind: source_kind,
                 item: match meta.mode {
@@ -230,6 +242,18 @@ impl PrometheusReader {
                 label(&mut self.buffer, &output.metric_type);
                 self.buffer.extend_from_slice(b"\",name=\"");
                 label(&mut self.buffer, &output.name);
+                if let Some(resource) = &output.resource {
+                    self.buffer.extend_from_slice(b"\",endpoint=\"");
+                    label(&mut self.buffer, &resource.endpoint);
+                    if let Some(access) = resource.access {
+                        self.buffer.extend_from_slice(b"\",access=\"");
+                        label(&mut self.buffer, access.label());
+                    }
+                    if let Some(role) = resource.role {
+                        self.buffer.extend_from_slice(b"\",role=\"");
+                        label(&mut self.buffer, role.label());
+                    }
+                }
                 if let SourceKind::Api(code) = kind {
                     write!(self.buffer, "\",status_code=\"{code}").unwrap();
                 }

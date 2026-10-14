@@ -45,6 +45,7 @@ pub(crate) enum ScalarKind {
 #[derive(Clone)]
 pub(crate) struct ScalarMeta {
     pub(crate) name: Arc<str>,
+    pub(crate) resource: Option<crate::ResourceLabels>,
     pub(crate) kind: MetricType,
     pub(crate) mode: ScalarKind,
     pub(crate) item: ScalarPtr,
@@ -52,6 +53,7 @@ pub(crate) struct ScalarMeta {
 
 struct State {
     by_type: HashMap<(MetricType, ScalarKind), Names, RandomState>,
+    by_resource: HashMap<(MetricType, ScalarKind, crate::ResourceLabels), ScalarPtr, RandomState>,
     // Handles retain raw slot pointers: chunks must not move when this Vec grows.
     #[allow(clippy::vec_box)]
     slots: Vec<Box<[ScalarSlot; CHUNK_SIZE]>>,
@@ -69,6 +71,7 @@ impl Shard {
         Self {
             state: Mutex::new(State {
                 by_type: HashMap::default(),
+                by_resource: HashMap::default(),
                 slots: Vec::new(),
                 chunks: Vec::new(),
                 len: 0,
@@ -77,13 +80,23 @@ impl Shard {
         }
     }
 
-    fn register(&self, kind: MetricType, mode: ScalarKind, name: &str) -> ScalarPtr {
+    fn register(
+        &self,
+        kind: MetricType,
+        mode: ScalarKind,
+        name: &str,
+        resource: Option<&crate::ResourceLabels>,
+    ) -> ScalarPtr {
         let mut state = self.state.lock().expect("scalar shard mutex poisoned");
-        if let Some(item) = state
-            .by_type
-            .get(&(kind, mode))
-            .and_then(|names| names.get(name))
-        {
+        let resource_key = resource.map(|labels| (kind, mode, labels.clone()));
+        let existing = match &resource_key {
+            Some(key) => state.by_resource.get(key),
+            None => state
+                .by_type
+                .get(&(kind, mode))
+                .and_then(|names| names.get(name)),
+        };
+        if let Some(item) = existing {
             return *item;
         }
         let chunk = state.len / CHUNK_SIZE;
@@ -101,16 +114,24 @@ impl Shard {
             offset,
             ScalarMeta {
                 name: Arc::clone(&name),
+                resource: resource.cloned(),
                 kind,
                 mode,
                 item,
             },
         );
-        state
-            .by_type
-            .entry((kind, mode))
-            .or_default()
-            .insert(name, item);
+        match resource_key {
+            Some(key) => {
+                state.by_resource.insert(key, item);
+            }
+            None => {
+                state
+                    .by_type
+                    .entry((kind, mode))
+                    .or_default()
+                    .insert(name, item);
+            }
+        }
         state.len += 1;
         if added {
             self.index.store(Arc::new(ShardIndex {
@@ -137,7 +158,18 @@ impl ScalarRegistry {
     pub(crate) fn register(&self, kind: MetricType, mode: ScalarKind, name: &str) -> ScalarPtr {
         kind.validate();
         let shard = self.hasher.hash_one((kind, mode, name)) as usize & (SHARDS - 1);
-        self.shards[shard].register(kind, mode, name)
+        self.shards[shard].register(kind, mode, name, None)
+    }
+
+    pub(crate) fn register_resource(
+        &self,
+        kind: MetricType,
+        mode: ScalarKind,
+        labels: &crate::ResourceLabels,
+    ) -> ScalarPtr {
+        kind.validate();
+        let shard = self.hasher.hash_one((kind, mode, labels)) as usize & (SHARDS - 1);
+        self.shards[shard].register(kind, mode, &labels.name, Some(labels))
     }
 
     pub(crate) fn for_each(&self, mut f: impl FnMut(&ScalarMeta)) {
@@ -174,6 +206,13 @@ pub struct CounterMetric {
 }
 
 impl CounterMetric {
+    pub fn new_resource(kind: MetricType, labels: &crate::ResourceLabels) -> Self {
+        Self {
+            item: crate::registry()
+                .scalars
+                .register_resource(kind, ScalarKind::Counter, labels),
+        }
+    }
     pub fn new(kind: MetricType, name: &str) -> Self {
         Self {
             item: crate::registry()
@@ -202,6 +241,13 @@ pub struct GaugeMetric {
 }
 
 impl GaugeMetric {
+    pub fn new_resource(kind: MetricType, labels: &crate::ResourceLabels) -> Self {
+        Self {
+            item: crate::registry()
+                .scalars
+                .register_resource(kind, ScalarKind::Gauge, labels),
+        }
+    }
     pub fn new(kind: MetricType, name: &str) -> Self {
         Self {
             item: crate::registry()
@@ -241,6 +287,16 @@ pub struct ConnMetric {
 }
 
 impl ConnMetric {
+    pub fn new_resource(kind: MetricType, labels: &crate::ResourceLabels) -> Self {
+        assert!(
+            kind.is_conn(),
+            "ConnMetric requires a resource's Conn category"
+        );
+        Self {
+            current: GaugeMetric::new_resource(kind, labels),
+            total: CounterMetric::new_resource(kind, labels),
+        }
+    }
     pub fn new(kind: MetricType, name: &str) -> Self {
         assert!(
             kind.is_conn(),

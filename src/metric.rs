@@ -177,6 +177,13 @@ impl Metric {
         crate::registry().register(name, kind)
     }
 
+    /// Registers resource metadata once; recording retains only the compact handle.
+    pub fn new_resource(kind: MetricType, labels: &crate::ResourceLabels) -> Self {
+        kind.validate();
+        assert!(!kind.is_conn(), "connection values use ConnMetric");
+        crate::registry().register_resource(kind, labels)
+    }
+
     pub(crate) fn from_item(item: ItemPtr, policy: MetricPolicy) -> Self {
         Self { item, policy }
     }

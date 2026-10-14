@@ -9,10 +9,12 @@ mod metric;
 mod plan;
 pub mod prometheus;
 mod registry;
+mod resource;
 mod scalar;
 mod state;
 
 pub use metric::{Metric, MetricSnapshot, MetricType, ResourceMetric};
+pub use resource::{ConnectionRole, MetricAccess, ResourceLabels};
 pub use scalar::{ConnMetric, ConnectionGuard, CounterMetric, GaugeMetric};
 /// Cumulative request timing handle.
 pub type TimingMetric = Metric;
@@ -175,6 +177,7 @@ where
             let (metric_type, _) = kind.output();
             f(name, metric_type, snapshot);
         }
+        plan::ProfileMeta::Resource { labels, kind } => f(&labels.name, kind.output().0, snapshot),
         plan::ProfileMeta::Fanout(plan) => {
             for output in plan.outputs.iter() {
                 f(&output.name, &output.metric_type, snapshot);

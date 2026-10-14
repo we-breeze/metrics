@@ -47,8 +47,9 @@ provides an optional RAII guard. Registrations deduplicate by business kind, nam
 and storage kind; counter and gauge values never share the same atomic.
 
 Connection current values use `brz_conn` gauges; successful establishments use
-`brz_conn_total` counters. Redis uses its configured logical `host:port` as `name`,
-matching request metrics; Memcache groups connections by TCP port across hosts.
+`brz_conn_total` counters. Resource SDKs use a business `name` (defaulting to the endpoint) and a separate
+`endpoint="host:port"`. Redis retains the configured hostname; Memcache retains
+the full endpoint. Connection `role` is `read`, `write`, or `shared`.
 Protocol-ready connections are
 counted; retries that fail to establish/authenticate are not. Node reuse, SDK clones,
 and request reuse do not increment total. A reconnect increments it again. MySQL
@@ -152,7 +153,7 @@ Enable the optional Tokio adapter in a release containing this change (or use th
 checkout as a local path dependency):
 
 ```toml
-brz-metrics = { version = "0.0.10", features = ["tokio"] }
+brz-metrics = { version = "0.0.11", features = ["tokio"] }
 ```
 
 `PrometheusReader` then implements both `std::io::Read` and
@@ -222,7 +223,7 @@ library name:
 
 ```toml
 [dependencies]
-brz-metrics = "0.0.10"
+brz-metrics = "0.0.11"
 ```
 
 ## CI and publishing
@@ -271,5 +272,37 @@ library name. Existing explicit dependency aliases remain supported.
 
 ```toml
 [dependencies]
-brz-metrics = "0.0.10"
+brz-metrics = "0.0.11"
 ```
+
+## Resource metadata and allocation-free updates
+
+```rust
+use brz_metrics::{TimingMetric, ConnMetric, MetricType, ResourceMetric,
+    ResourceLabels, MetricAccess, ConnectionRole};
+let labels = ResourceLabels::new("backend", "cache.example:6379");
+// Register all handles during resource construction, never inside a request.
+let read = TimingMetric::new_resource(MetricType::Redis(ResourceMetric::Req),
+    &labels.clone().with_access(MetricAccess::Read));
+let connections = ConnMetric::new_resource(MetricType::Redis(ResourceMetric::Conn),
+    &labels.with_role(ConnectionRole::Write));
+read.record(std::time::Duration::from_millis(31), true);
+```
+
+Request `access` describes the operation even on fallback; connection `role`
+describes its purpose independently. All metadata is immutable and registered
+once; recording uses compact Copy handles and atomics without allocations.
+Timing slots remain 64 bytes and scalar slots 8 bytes. Prometheus export allocates
+its snapshot metadata at scrape time. Resource handles with identical full labels
+share slots; different names, endpoints, access values or roles remain distinct.
+Legacy `new(kind, name)` constructors retain their original labels.
+
+```text
+brz_req_total{type="REDIS",name="backend",endpoint="cache.example:6379",access="read"} 100
+brz_req_duration_secs_total{type="REDIS",name="backend",endpoint="cache.example:6379",access="read"} 3.10
+brz_conn{type="REDIS",name="backend",endpoint="cache.example:6379",role="write"} 1
+brz_conn_total{type="REDIS",name="backend",endpoint="cache.example:6379",role="write"} 4
+```
+
+Use `sum by (type, name) (rate(brz_req_total[1m]))` for aggregate request rates;
+keep `access` or `endpoint` in the grouping to inspect directions or servers.

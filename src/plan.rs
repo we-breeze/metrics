@@ -30,6 +30,7 @@ pub enum ProfileFormat {
 pub struct ProfileOutput {
     pub(crate) metric_type: Arc<str>,
     pub(crate) name: Arc<str>,
+    pub(crate) resource: Option<crate::ResourceLabels>,
 }
 
 impl ProfileOutput {
@@ -37,6 +38,7 @@ impl ProfileOutput {
         Self {
             metric_type: metric_type.into(),
             name: name.into(),
+            resource: None,
         }
     }
 }
@@ -97,6 +99,10 @@ pub(crate) enum ProfileMeta {
     Single {
         name: Arc<str>,
         kind: crate::metric::MetricType,
+    },
+    Resource {
+        labels: crate::ResourceLabels,
+        kind: crate::MetricType,
     },
     Fanout(Arc<ProfilePlan>),
 }

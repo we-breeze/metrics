@@ -100,6 +100,7 @@ struct ShardState {
     /// Splitting by kind permits `get(name)` to borrow `&str`, avoiding a temporary allocation for
     /// repeated registrations.
     by_type: FastHashMap<MetricType, FastHashMap<Arc<str>, ItemPtr>>,
+    by_resource: FastHashMap<(MetricType, crate::ResourceLabels), ItemPtr>,
     by_profile: FastHashMap<MetricPolicy, FastHashMap<Arc<str>, ItemPtr>>,
     slots: Vec<Box<[Slot; CHUNK_SIZE]>>,
     meta_chunks: Vec<Arc<MetaChunk>>,
@@ -110,6 +111,7 @@ impl ShardState {
     fn new() -> Self {
         Self {
             by_type: FastHashMap::default(),
+            by_resource: FastHashMap::default(),
             by_profile: FastHashMap::default(),
             slots: Vec::new(),
             meta_chunks: Vec::new(),
@@ -260,6 +262,27 @@ impl Registry {
         let shard = (self.shard_hasher.hash_one((&plan.identity, plan.policy)) as usize)
             & (SHARD_COUNT - 1);
         self.shards[shard].register_profile(plan)
+    }
+
+    pub(crate) fn register_resource(
+        &self,
+        kind: MetricType,
+        labels: &crate::ResourceLabels,
+    ) -> Metric {
+        let key = (kind, labels.clone());
+        let index = self.shard_hasher.hash_one(&key) as usize & (SHARD_COUNT - 1);
+        let shard = &self.shards[index];
+        let mut state = shard.state.lock().expect("metrics shard mutex poisoned");
+        if let Some(item) = state.by_resource.get(&key) {
+            return Metric::from_item(*item, kind.policy());
+        }
+        let profile = ProfileMeta::Resource {
+            labels: labels.clone(),
+            kind,
+        };
+        let (metric, item) = state.allocate(&shard.published_index, profile, kind.policy());
+        state.by_resource.insert(key, item);
+        metric
     }
 
     pub(crate) fn record_state(&self, state_type: StateType, name: &str, key: &str, value: &str) {
