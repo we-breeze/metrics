@@ -61,6 +61,8 @@ pub enum MetricType {
     ApiTimeout,
     Rpc(ResourceMetric),
     Service(ResourceMetric),
+    /// Socket.IO namespace sessions and logical handler operations.
+    SocketIo(ResourceMetric),
     RpcServiceWhole,
 }
 
@@ -74,6 +76,7 @@ impl MetricType {
                 | Self::Http(ResourceMetric::Conn)
                 | Self::Rpc(ResourceMetric::Conn)
                 | Self::Service(ResourceMetric::Conn)
+                | Self::SocketIo(ResourceMetric::Conn)
         )
     }
 
@@ -101,6 +104,7 @@ impl MetricType {
             | Self::Http(_) => MetricPolicy::Resource,
             Self::HttpAll
             | Self::Service(_)
+            | Self::SocketIo(_)
             | Self::ApiAll
             | Self::Api(_)
             | Self::Api3xx
@@ -126,6 +130,7 @@ impl MetricType {
             Self::Api5xx => ("API5XX", ProfileFormat::Resource),
             Self::ApiTimeout => ("APITO", ProfileFormat::Resource),
             Self::Service(_) => ("SERVICE", ProfileFormat::Resource),
+            Self::SocketIo(_) => ("SOCKET_IO", ProfileFormat::Resource),
             Self::Rpc(_) => ("RPC", ProfileFormat::AccessStatistic),
             Self::RpcServiceWhole => ("RPC_SERVICE_WHOLE", ProfileFormat::AccessStatistic),
         }

@@ -64,6 +64,32 @@ fn counters_are_cumulative_and_durations_use_seconds() {
 }
 
 #[test]
+fn socket_io_uses_a_distinct_type_and_the_service_slow_policy() {
+    let registry = Arc::new(Registry::new());
+    let metric = registry.register(
+        "namespace:/chat:admission",
+        MetricType::SocketIo(crate::ResourceMetric::Req),
+    );
+    metric.record(Duration::from_millis(199), false);
+    metric.record(Duration::from_millis(200), true);
+    let output = text(&registry);
+    let values = samples(&output);
+    assert_eq!(
+        values["brz_req_total{type=\"SOCKET_IO\",name=\"namespace:/chat:admission\"}"],
+        "2"
+    );
+    assert_eq!(
+        values["brz_err_total{type=\"SOCKET_IO\",name=\"namespace:/chat:admission\"}"],
+        "1"
+    );
+    assert_eq!(
+        values["brz_slow_total{type=\"SOCKET_IO\",name=\"namespace:/chat:admission\"}"],
+        "1"
+    );
+    assert!(MetricType::SocketIo(crate::ResourceMetric::Conn).is_conn());
+}
+
+#[test]
 fn duration_rounding_handles_half_centiseconds_carry_and_large_totals() {
     for (micros, expected) in [
         (0, "0.00"),
